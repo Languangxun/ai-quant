@@ -115,13 +115,15 @@ class StockBacktest:
                  start=None, end=None, limit=0, boards=None, progress=print):
         cfg = _load_cfg()
         self.cfg = cfg
-        self.capital = float(capital or cfg["capital"])
+        self.capital = float(capital or cfg.get("backtest", {}).get("capital")
+                             or cfg["capital"])
         self.risk_mode = risk_mode or cfg.get("risk_mode", "稳健")
         self.max_positions = int(max_positions or cfg["max_positions"])
         self.max_position_pct = float(
             max_position_pct or cfg["max_position_pct"])
         self.min_order_amount = float(
             min_order_amount or cfg["min_order_amount"])
+        self.min_order_pct = float(cfg.get("min_order_pct", 5.0))
         self.exec_px = exec_px or cfg.get("exec_px", "close")
         self.check_limit = check_limit
         self.min_bars = int(min_bars or cfg["universe"]["min_bars"])
@@ -374,7 +376,9 @@ class StockBacktest:
             amount = min(total / self.max_positions, cap,
                          self.account.cash)
             shares = self.account.max_buy_shares(px, cash=amount)
-            if shares <= 0 or shares * px < self.min_order_amount:
+            floor_amt = min(self.min_order_amount,
+                            total * self.min_order_pct / 100.0)
+            if shares <= 0 or shares * px < floor_amt:
                 continue
             try:
                 t = self.account.buy(code, px, shares, day, self._next_day(day),

@@ -451,6 +451,59 @@ def market_info(base):
             "holidays": holidays}
 
 
+def load_stock_settings(base):
+    """从 config/stock.yaml 提取展示用标量（stdlib-only，不依赖 yaml）。"""
+    try:
+        with open(os.path.join(base, "config", "stock.yaml"),
+                  encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return {}
+    out = {}
+    for key in ("capital", "max_positions", "max_position_pct",
+                "min_order_amount", "min_order_pct", "risk_mode"):
+        m = re.search(rf"^\s*{key}:\s*([^#\n]+)", text, re.M)
+        if m:
+            out[key] = m.group(1).strip().strip("\"'")
+    m = re.search(r"max_scan:\s*([^#\n]+)", text)
+    if m:
+        out["max_scan"] = m.group(1).strip()
+    m = re.search(r"times:\s*\[([^\]]*)\]", text)
+    if m:
+        out["times"] = [t.strip().strip("\"'") for t in m.group(1).split(",")
+                        if t.strip()]
+    return out
+
+
+def stock_sim_strategy_text(base, state, latest):
+    st = load_stock_settings(base)
+    times = st.get("times") or []
+
+    def num(key, default=None):
+        try:
+            return float(st.get(key))
+        except (TypeError, ValueError):
+            return default
+
+    cap = ((state or {}).get("initial_capital")
+           or num("capital") or 20000.0)
+    parts = [f"{st.get('risk_mode', '稳健')}档",
+             f"扫描市值前{st.get('max_scan', '?')}",
+             f"最多{st.get('max_positions', '?')}只",
+             f"单票≤{st.get('max_position_pct', '?')}%",
+             f"本金 {cap:,.0f} 元",
+             f"最小下单 {st.get('min_order_amount', '?')}元"
+             f"（小资金按{st.get('min_order_pct', '?')}%自适应）"]
+    if times:
+        parts.append(f"日内{len(times)}时点 " + "/".join(times))
+    sessions = (latest or {}).get("sessions") or []
+    line2 = "策略参数：" + " · ".join(parts)
+    if sessions:
+        line2 += (f"<br>今日已运行 {len(sessions)} 个时点"
+                  f"（最近 {sessions[-1].get('time', '?')}）")
+    return line2
+
+
 def load_stock_sim(base):
     dailies = []
     for p in sorted(glob.glob(os.path.join(base, "memory", "daily", "stock-*.json"))):
@@ -618,7 +671,7 @@ def stock_section(base, mk=None):
     return f"""
 <h2 id="live">股票模拟盘</h2>
 <div class="sub2">CLI 选股 + deepseek-v4.1-flash 组合决策 + A股规则（100股整手/T+1/涨跌停）· 数据 {date}{stale}<br>
-策略参数：稳健档 · 每日扫描市值前120 · 最多5只 · 单票≤20% · 收盘成交 · 14:50 决策</div>
+{stock_sim_strategy_text(base, state, latest)}</div>
 <div class="card">{head}</div>
 <div class="card"><table>{acc_table}</table></div>
 <div class="card"><div class="lbl">资产曲线（每交易日快照）</div>{chart}</div>

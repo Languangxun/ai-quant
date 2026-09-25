@@ -2,7 +2,8 @@
 
 风控（execute 内统一校验）：
 - 单票不超过 max_position_pct；同时持仓不超过 max_positions
-- 买入金额不低于 min_order_amount；现金不足自动缩量或放弃
+- 买入金额不低于 min(min_order_amount, 总资产×min_order_pct%)，
+  小资金自动放宽，避免固定门槛吃掉整单
 - SELL 只卖已解锁（T+1）份额；涨跌停附近不成交（可选）
 """
 import math
@@ -31,14 +32,20 @@ def price_limit_pct(code):
 class StockExecutor:
     def __init__(self, account, calendar=None, max_positions=5,
                  max_position_pct=20.0, min_order_amount=5000.0,
-                 check_limit=True):
+                 min_order_pct=5.0, check_limit=True):
         self.account = account
         self.calendar = calendar or TradingCalendar()
         self.max_positions = int(max_positions)
         self.max_position_pct = float(max_position_pct)
         self.min_order_amount = float(min_order_amount)
+        self.min_order_pct = float(min_order_pct)
         self.check_limit = check_limit
         self.history = []
+
+    def min_amount_for(self, total_asset):
+        """当前总资产下的单笔最小买入金额（固定上限与比例下限取小）。"""
+        return min(self.min_order_amount,
+                   float(total_asset) * self.min_order_pct / 100.0)
 
     def _next_date(self, trade_date):
         return str(self.calendar.next_trading_day(_as_date(trade_date)))
@@ -77,10 +84,15 @@ class StockExecutor:
         cap = total * self.max_position_pct / 100.0
         current = self.account.position_value(code, price)
         amount = min(amount, cap - current)
-        if amount < self.min_order_amount:
+        if amount < self.min_amount_for(total):
             return "NO CHANGE 金额不足"
         shares = int(amount / price)
         shares -= shares % self.account.lot_size
+        if shares <= 0:
+            # 目标金额不足一手但单票额度够：按一手取整（小资金常见）
+            lot_cost = price * self.account.lot_size
+            if lot_cost <= cap - current + 1e-9:
+                shares = self.account.lot_size
         shares = min(shares, self.account.max_buy_shares(price))
         if shares <= 0:
             return "NO CHANGE 现金不足"

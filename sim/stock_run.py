@@ -28,6 +28,7 @@ from trading.stock_executor import StockExecutor
 from data.stock import cli_bridge as bridge
 from memory import otc_memory
 from scripts.usb_backup import backup as usb_backup
+from sim import intraday
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_PATH = os.path.join(BASE_DIR, "sim", "state", "stock_account.json")
@@ -117,80 +118,24 @@ def build_query_text(context):
     return " ".join(parts)
 
 
-def write_daily_summary(date_str, context, result, trades, account, prices):
-    folder = os.path.join(BASE_DIR, "memory", "daily")
-    os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, f"stock-{date_str}.json")
-    summary = {
-        "time": datetime.now().isoformat(),
-        "date": date_str,
-        "market_view": (result or {}).get("market_view"),
-        "orders": (result or {}).get("orders"),
-        "trades": [t.to_dict() if hasattr(t, "to_dict") else str(t)
-                   for t in trades],
-        "account": account.snapshot(prices),
-        "candidates": [
-            {k: c[k] for k in ("code", "name", "score", "chg", "price")
-             if k in c} for c in context.get("candidates", [])[:20]
-        ],
-    }
-    with open(path, "w", encoding="utf-8") as f:
+def write_daily_summary(path, summary):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
     return path
 
 
-def write_review(date_str, context, result, trades, account, prices,
-                 similar):
-    folder = os.path.join(BASE_DIR, "memory", "daily")
-    os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, f"股票复盘-{date_str}.md")
-    snap = account.snapshot(prices)
-    lines = [f"# 股票模拟盘复盘 {date_str}", ""]
-    lines.append(f"- 总资产：{snap['total_asset']} 元")
-    lines.append(f"- 现金：{snap['cash']} 元")
-    lines.append(f"- 已实现收益：{snap['realized_pnl']} 元")
-    lines.append(f"- 未实现收益：{snap['unrealized_pnl']} 元")
-    lines.append("")
-    if result:
-        lines.append("## 模型观点")
-        lines.append(f"- {result.get('market_view', '')}")
-        lines.append("")
-        if result.get("orders"):
-            lines.append("## 模型指令")
-            for o in result["orders"]:
-                lines.append(
-                    f"- {o.get('action')} {o.get('code')} "
-                    f"仓位{o.get('position')}% {o.get('reason', '')}")
-            lines.append("")
-    lines.append("## 执行")
-    if trades:
-        for t in trades:
-            if hasattr(t, "to_dict"):
-                d = t.to_dict()
-                lines.append(
-                    f"- {d['side']} {d['code']} {d['shares']}股 "
-                    f"@{d['price']} 费用{d['fee']}")
-            else:
-                lines.append(f"- {t}")
-    else:
-        lines.append("- 无成交")
-    lines.append("")
-    lines.append("## 持仓")
-    if snap["positions"]:
-        for code, p in snap["positions"].items():
-            lines.append(
-                f"- {code}: {p['shares']}股 成本{p['cost']} 现价{p['price']} "
-                f"({p['pnl_pct']:+.2f}%, 仓位{p['pct']}%)")
-    else:
-        lines.append("- 空仓")
-    lines.append("")
+def write_review(path, date_str, summary, similar=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    text = intraday.render_review(date_str, summary)
     if similar:
-        lines.append("## 相似历史")
+        text += "\n## 相似历史\n"
         for s in similar[:3]:
-            lines.append(f"- ({s['score']:.2f}) {s['text'][:80]}")
-        lines.append("")
+            text += f"- ({s['score']:.2f}) {s['text'][:80]}\n"
     with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+        f.write(text)
     return path
 
 
@@ -232,8 +177,14 @@ def main(argv=None):
     now = datetime.now()
     trade_date = calendar.trade_date_of(now)
     next_date = str(calendar.next_trading_day(trade_date))
-    print(f"=== 股票模拟盘 {now:%Y-%m-%d %H:%M} ===")
+    stamp = intraday.session_time(now)
+    icfg = cfg.get("intraday") or {}
+    is_new = not os.path.exists(args.state)
+    print(f"=== 股票模拟盘 {now:%Y-%m-%d %H:%M}（时点 {stamp}）===")
     print(f"交易日 T = {trade_date}（T+1 可卖日 {next_date}）")
+    if is_new:
+        print(f"首次建盘：本金 {args.capital:,.0f} 元"
+              f"（config/stock.yaml capital 或 --capital 可配）")
 
     account = load_account(args.state, args.capital, cfg)
     executor = StockExecutor(
@@ -241,7 +192,18 @@ def main(argv=None):
         max_positions=cfg["max_positions"],
         max_position_pct=cfg["max_position_pct"],
         min_order_amount=cfg["min_order_amount"],
+        min_order_pct=cfg.get("min_order_pct", 5.0),
     )
+
+    daily_path = os.path.join(
+        BASE_DIR, "memory", "daily", f"stock-{trade_date}.json")
+    existing = intraday.load_daily(daily_path)
+    bought_codes, buy_count = intraday.daily_buys(existing)
+    sold_codes = intraday.daily_sold(existing)
+    if existing:
+        print(f"当日已有 {len(existing.get('sessions') or [])} 个时点、"
+              f"{buy_count} 笔买入；本时点限额剩余 "
+              f"{max(0, int(icfg.get('max_buys_per_day', 3)) - buy_count)} 笔")
 
     # 候选 + 行情
     print(f"扫描候选（前 {args.scan} 只，取 Top{args.top}）...")
@@ -285,17 +247,28 @@ def main(argv=None):
             "sellable": account.available_shares(code, str(trade_date)),
         })
 
+    total_asset = account.total_asset(prices)
     context = {
         "date": str(trade_date),
         "mode": "stock",
+        "session": stamp,
+        "intraday": {
+            "times": icfg.get("times") or [],
+            "max_buys_per_day": icfg.get("max_buys_per_day", 3),
+            "once_per_code_per_day": icfg.get("once_per_code_per_day", True),
+        },
         "candidates": cands,
         "positions": positions,
         "account": {
             "cash": round(account.cash, 2),
-            "total_asset": round(account.total_asset(prices), 2),
+            "total_asset": round(total_asset, 2),
+            "capital": account.initial_capital,
             "position_count": len(positions),
             "max_positions": cfg["max_positions"],
             "max_position_pct": cfg["max_position_pct"],
+            "min_order": round(executor.min_amount_for(total_asset), 2),
+            "bought_today": sorted(bought_codes),
+            "sold_today": sorted(sold_codes),
             "t_plus_1_note": f"今日买入 {next_date} 起可卖",
         },
         "lessons": otc_memory.load_lessons(5),
@@ -325,32 +298,59 @@ def main(argv=None):
                   f"pos={o.get('position')} conf={o.get('confidence')} "
                   f"{o.get('reason', '')[:40]}")
 
-    # 执行
+    # 执行（日内买入闸门：同票当日不重复、每日笔数上限）
     trades = []
-    if not args.dry_run:
-        for o in (result or {}).get("orders", []):
-            t = executor.execute_order(o, prices, str(trade_date),
-                                       prev_closes)
-            print(f"  执行 {o.get('code')}: {t if not hasattr(t, 'to_dict') else t.to_dict()}")
-            if hasattr(t, "to_dict"):
-                trades.append(t)
-    else:
+    skipped = []
+    working = {"trades": list(existing.get("trades") or [])}
+    for o in (result or {}).get("orders", []):
+        action = str(o.get("action") or "HOLD").upper()
+        if action == "BUY":
+            why = intraday.skip_buy(o, working, icfg)
+            if why:
+                skipped.append(f"{o.get('code')} {why}")
+                print(f"  跳过 {o.get('code')}: {why}")
+                continue
+        if args.dry_run:
+            continue
+        t = executor.execute_order(o, prices, str(trade_date), prev_closes)
+        print(f"  执行 {o.get('code')}: {t if not hasattr(t, 'to_dict') else t.to_dict()}")
+        if hasattr(t, "to_dict"):
+            trades.append(t)
+            working["trades"].append(t.to_dict())
+    if args.dry_run:
         print("[dry-run] 不执行")
 
-    # 保存 + 复盘 + 记忆 + 备份 + 维护
+    # 合并当日汇总 + 复盘 + 记忆 + 备份 + 维护
+    session = {
+        "time": stamp,
+        "time_iso": now.isoformat(),
+        "date": str(trade_date),
+        "market_view": (result or {}).get("market_view"),
+        "orders": (result or {}).get("orders") or [],
+        "trades": [t.to_dict() for t in trades],
+        "skipped": skipped,
+    }
+    candidates_out = [
+        {k: c[k] for k in ("code", "name", "score", "chg", "price") if k in c}
+        for c in context.get("candidates", [])[:20]
+    ]
+    summary = intraday.merge_summary(
+        existing, session, account.snapshot(prices), candidates_out)
     save_account(args.state, account)
-    summary_path = write_daily_summary(
-        str(trade_date), context, result, trades, account, prices)
+    summary_path = write_daily_summary(daily_path, summary)
     review_path = write_review(
-        str(trade_date), context, result, trades, account, prices, similar)
+        os.path.join(BASE_DIR, "memory", "daily",
+                     f"股票复盘-{trade_date}.md"),
+        str(trade_date), summary, similar)
     print(f"状态已保存: {args.state}")
-    print(f"总结已保存: {summary_path}")
+    print(f"总结已保存: {summary_path}（当日 {len(summary['sessions'])} 个时点）")
     print(f"复盘已保存: {review_path}")
 
     otc_memory.add_memory(
-        str(trade_date), build_query_text(context),
-        (f"股票 {len(trades)} 笔: " + ", ".join(
-            f"{t.side}{t.code}" for t in trades)) if trades else "股票 HOLD",
+        f"{trade_date} {stamp}", build_query_text(context),
+        (f"[{stamp}] 股票 {len(trades)} 笔: " + ", ".join(
+            f"{t.side}{t.code}" for t in trades)) if trades
+        else f"[{stamp}] 股票 HOLD",
         json.dumps(account.snapshot(prices), ensure_ascii=False)[:200],
     )
 

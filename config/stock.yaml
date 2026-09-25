@@ -1,13 +1,20 @@
 # 股票模拟盘 / 回测参数（trading.stock_account + sim.stock_run + backtest.stock_engine）
 stock:
 
-  capital: 100000
+  capital: 20000              # 实盘初始本金（首次建盘生效；改本金用 scripts/reset_account.py）
 
   # 组合约束
   max_positions: 5            # 最大同时持仓数
   max_position_pct: 20        # 单票上限（占总资产 %）
-  min_order_amount: 5000      # 单笔最小买入金额
+  min_order_amount: 5000      # 单笔最小买入金额（金额上限）
+  min_order_pct: 5            # 小资金自适应：实际下限 = min(min_order_amount, 总资产×该比例%)
   lot_size: 100               # A股一手
+
+  # 日内多时点交易（建议与 crontab 同步；每个时点独立扫描/决策/执行）
+  intraday:
+    times: ["10:00", "11:00", "13:30", "14:45"]
+    max_buys_per_day: 3       # 每日最多买入笔数（含加仓）
+    once_per_code_per_day: true   # 同一只票当日不重复加仓
 
   # 交易费用（A股）
   fees:
@@ -37,7 +44,8 @@ stock:
     exclude_bj: true
     boards: all               # all=全市场；main=仅沪深主板
 
-  # 回测
+  # 回测（日线口径，不含日内多次决策）
   backtest:
+    capital: 100000           # 回测默认本金（保持历史口径）
     start: ""                 # 空=全缓存；可填 2023-01-01
     benchmark: ""             # 空=等权全市场；可填 sh000001
