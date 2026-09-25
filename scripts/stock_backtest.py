@@ -28,6 +28,10 @@ def main():
                     help="只测市值前 N 只（0=全缓存）")
     ap.add_argument("--boards", default=None, choices=["all", "main"],
                     help="股票池板块：all=全市场，main=沪深主板")
+    ap.add_argument("--etf", dest="include_etf", action="store_true",
+                    default=None, help="股票池纳入ETF（默认读 config）")
+    ap.add_argument("--no-etf", dest="include_etf", action="store_false",
+                    help="股票池剔除ETF")
     ap.add_argument("--exec-px", default=None, choices=["close", "open"])
     ap.add_argument("--tag", default=None, help="结果文件名标签")
     args = ap.parse_args()
@@ -36,6 +40,7 @@ def main():
         capital=args.capital, risk_mode=args.mode,
         max_positions=args.max_positions, start=args.start, end=args.end,
         limit=args.limit, exec_px=args.exec_px, boards=args.boards,
+        include_etf=args.include_etf,
     )
     bt.run()
     print(json.dumps(bt.stats, ensure_ascii=False, indent=2, default=str))

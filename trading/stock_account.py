@@ -83,21 +83,27 @@ class StockAccount:
         self.order_seq = 0
 
     # ---------- 费用 ----------
+    # transfer/stamp 传入 None 表示用账户默认值；ETF 由执行器传 0.0。
 
-    def _buy_fee(self, amount):
+    def _buy_fee(self, amount, transfer_fee_rate=None):
         commission = max(amount * self.commission_rate, self.min_commission)
-        transfer = amount * self.transfer_fee_rate
+        transfer = amount * (self.transfer_fee_rate
+                             if transfer_fee_rate is None
+                             else float(transfer_fee_rate))
         return commission + transfer
 
-    def _sell_fee(self, amount):
+    def _sell_fee(self, amount, stamp_tax_rate=None, transfer_fee_rate=None):
         commission = max(amount * self.commission_rate, self.min_commission)
-        stamp = amount * self.stamp_tax_rate
-        transfer = amount * self.transfer_fee_rate
+        stamp = amount * (self.stamp_tax_rate
+                          if stamp_tax_rate is None else float(stamp_tax_rate))
+        transfer = amount * (self.transfer_fee_rate
+                             if transfer_fee_rate is None
+                             else float(transfer_fee_rate))
         return commission + stamp + transfer
 
     # ---------- 买入 ----------
 
-    def max_buy_shares(self, price, cash=None):
+    def max_buy_shares(self, price, cash=None, transfer_fee_rate=None):
         """给定价格下可买的最大整手股数（预留费用）。"""
         cash = self.cash if cash is None else float(cash)
         if price <= 0 or cash <= 0:
@@ -106,19 +112,21 @@ class StockAccount:
         raw -= raw % self.lot_size
         while raw > 0:
             amount = raw * price
-            if amount + self._buy_fee(amount) <= cash + 1e-9:
+            if amount + self._buy_fee(
+                    amount, transfer_fee_rate=transfer_fee_rate) \
+                    <= cash + 1e-9:
                 return raw
             raw -= self.lot_size
         return 0
 
     def buy(self, code, price, shares, trade_date, sellable_date,
-            reason="", confidence=0.0):
+            reason="", confidence=0.0, transfer_fee_rate=None):
         """买入。shares 必须为整手，现金不足或非法数量抛 ValueError。"""
         shares = int(shares)
         if shares <= 0 or shares % self.lot_size:
             raise ValueError(f"买入股数 {shares} 非 {self.lot_size} 整数倍")
         amount = price * shares
-        fee = self._buy_fee(amount)
+        fee = self._buy_fee(amount, transfer_fee_rate=transfer_fee_rate)
         if amount + fee > self.cash + 1e-9:
             raise ValueError(
                 f"现金不足：需 {amount + fee:.2f}，有 {self.cash:.2f}")
@@ -151,7 +159,7 @@ class StockAccount:
         return sum(l.shares for l in self.lots.get(code, []))
 
     def sell(self, code, price, shares, trade_date, reason="",
-             confidence=0.0):
+             confidence=0.0, stamp_tax_rate=None, transfer_fee_rate=None):
         """卖出（FIFO 扣批次，仅可卖已解锁份额）。"""
         shares = int(shares)
         if shares <= 0:
@@ -160,7 +168,8 @@ class StockAccount:
         if shares > avail:
             raise ValueError(f"可卖 {avail} 股，不足 {shares} 股")
         amount = price * shares
-        fee = self._sell_fee(amount)
+        fee = self._sell_fee(amount, stamp_tax_rate=stamp_tax_rate,
+                             transfer_fee_rate=transfer_fee_rate)
         remaining = shares
         realized = 0.0
         keep = []

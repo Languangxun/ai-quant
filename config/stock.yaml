@@ -40,9 +40,22 @@ stock:
     max_scan: 120             # 实盘每日扫描上限（按市值降序；Pi上约2-3分钟）
     min_price: 2.0            # 剔除仙股
     recent_days: 15           # 最新K线需在最近 N 个自然日内（剔除停牌/退市）
-    exclude_etf: true
+    exclude_etf: false        # 兼容旧开关；false 时再看 include_etf
+    include_etf: true         # 股票+ETF 同池混选（需 CLI --refresh-etf 回填数据）
+    etf_min_price: 0.5        # ETF 单独的低价过滤（不少宽基ETF低于2元）
+    etf_max_scan: 30          # ETF 独立扫描配额（避免被大市值股票挤出 max_scan）
     exclude_bj: true
     boards: all               # all=全市场；main=仅沪深主板
+
+  # 市场规则（trading/instruments.MarketModel）
+  market:
+    etf:
+      # T+0 类别：跨境/债券/黄金/货币/商品；不配置则用内置默认
+      t0_all: false           # true=所有 ETF 按 T+0（不推荐）
+      t0_codes: []            # 显式补充 T+0 代码，如 [sz159941]
+      # t0_keywords: [...]    # 覆盖内置关键词
+      # t0_prefixes: [sh511, sh513, sh518]
+      limit_pct_overrides: {} # 显式涨跌停覆盖，如 {sh510300: 0.10}
 
   # 回测（日线口径，不含日内多次决策）
   backtest:

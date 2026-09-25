@@ -1,9 +1,14 @@
 # ai-quant · OrangePi 量化系统
 
-Pi（`orangepizero2w`）上的 AI 量化研究与模拟交易系统：**股票组合模拟盘**
+Pi（`orangepizero2w`）上的 AI 量化研究与模拟交易系统：**股票+ETF 组合模拟盘**
 （CLI 选股 + LLM 决策 + A股账本 + 全缓存回测）、旧版场外 ETF 联接 C 类基金
 模式（etf-c，保留可切换）、每日复盘与 U 盘快照备份，并接收本机
 stock-analyzer 通过 `--push` 推送的分析报告。
+
+架构借鉴 [AKQuant](https://github.com/akfamily/akquant) 的三层拆分（轻量 Python 版）：
+`MarketModel`（可插拔交易规则：股票/ETF、T+1/T+0、涨跌停、费用）、
+独立 `RiskManager` 预交易风控拦截层、订单生命周期日志（REQUESTED →
+VALIDATED → FILLED / REJECTED / NO_CHANGE）。
 
 ## 目录
 
@@ -13,7 +18,8 @@ stock-analyzer 通过 `--push` 推送的分析报告。
 | `agent/` | 决策链路（stock_decision 股票组合 / ensemble 基金多模型） |
 | `models/` | 模型客户端（deepseek / embedding / prompt / stock_prompt） |
 | `config/` | 运行配置（system / model / risk / **stock** / **holidays** 休市日历） |
-| `trading/` | 账户与执行（**stock_account/stock_executor** + 基金 account/executor） |
+| `trading/` | 账户与执行（**stock_account/stock_executor** + 基金 account/executor）；`instruments.py` 市场规则（股票/ETF）、`orders.py` 订单状态日志 |
+| `risk/` | 风控：`stock_rules.py` 股票/ETF 预交易拦截层；`manager.py` 场外基金仓位规则 |
 | `sim/` | 模拟盘：`run.py` 双模式调度，`stock_run.py` / `fund_run.py` |
 | `backtest/` | 回测：`stock_engine.py` 股票组合全缓存回测 + 基金引擎 |
 | `data/` | 行情、基金映射、特征、历史缓存；`data/stock/cli_bridge.py` 桥接 CLI |
@@ -46,6 +52,7 @@ stock-analyzer 通过 `--push` 推送的分析报告。
   .venv/bin/python scripts/stock_backtest.py                  # 全量（约4860只）
   .venv/bin/python scripts/stock_backtest.py --limit 300      # 抽样
   .venv/bin/python scripts/stock_backtest.py --mode 激进 --exec-px open
+  .venv/bin/python scripts/stock_backtest.py --no-etf         # 纯股票口径
   ```
   信号 T 日收盘生成、T+1 成交；ATR(14) 跟踪止损；100股整手/T+1/佣金
   万2.5+印花税0.05%；基准=等权全市场 + 上证指数。结果落
@@ -54,8 +61,20 @@ stock-analyzer 通过 `--push` 推送的分析报告。
   - 实测（2020-02~2026-09）：市值前 300 年化 **+16.1%**、Sharpe **1.01**
     （超额上证 +63.9pp）；全市场 +1.0% —— **信号边际集中在大市值**，
     实盘候选默认按市值前 120 扫描与此一致。
-- **A股规则**：整手买入、T+1 可卖、涨跌停不成交、最多 5 只、单票 ≤20%、
-  日内买入笔数上限；下单金额随本金自适应。
+- **股票 + ETF 同池**：候选池含 ETF（`config/stock.yaml`
+  `universe.include_etf`）。ETF 数据需先用 CLI 回填：
+  `cd scripts/cli && python3 stock_predict.py --refresh-etf`（约1500只，
+  10~25分钟）；市场规则在 `trading/instruments.py`（可用
+  `stock.market.etf` 覆盖）：
+  - 股票：T+1，涨跌停 10%（创业板/科创板 20%，主板 ST 5%），印花税+过户费
+  - ETF：股票型 T+1；跨境/债券/黄金/货币/商品类 T+0（代码前缀 sh511/
+    sh513/sh518 + 名称关键词识别）；免印花税与过户费；创业板/科创板
+    相关 ETF 涨跌停 20%
+- **A股规则**：整手买入、T+1 可卖（T+0 标的当日可卖）、涨跌停不成交、
+  最多 5 只、单票 ≤20%、日内买入笔数上限；下单金额随本金自适应。
+- **订单日志**：指令状态落 `sim/state/order_journal.jsonl`（REQUESTED →
+  VALIDATED → FILLED / REJECTED / NO_CHANGE），风控在
+  `risk/stock_rules.py` 独立拦截层统一判定。
 
 ## CLI（预测/选股引擎）
 
@@ -63,7 +82,9 @@ stock-analyzer 通过 `--push` 推送的分析报告。
 cd scripts/cli && python3 stock_predict.py 000725
 ```
 
-- 缓存：`scripts/cli/stock_cache.db`（全市场日K，约 813 万根）
+- 源码 `scripts/cli/stock_predict.py` 已入库（生成物但随仓库分发）；
+  缓存 `scripts/cli/stock_cache.db`（全市场日K，约 813 万根）不入库，
+  新环境用 `--refresh-cache` / `--backfill` / `--refresh-etf` 重建
 - AI：优先 `DEEPSEEK_API_KEY` / `stock_gui.ini [deepseek]`；缺省回退主目录
   opencode-go 授权（`~/.local/share/opencode/auth.json`）
 - 支持 `--tiers` / `--research` / `--push` 等（见文件头注释）
