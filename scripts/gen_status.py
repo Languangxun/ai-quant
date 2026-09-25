@@ -971,7 +971,7 @@ def build(base, health, out):
 {fund}
 {sys_part}
 <div class="foot">自动生成 · 每30分钟刷新 · <code>scripts/gen_status.py</code><br>
-本地预测系统 <a href="https://github.com/monologue-github/stock-analyzer"
+本地预测系统 <a href="https://github.com/Languangxun/stock-analyzer"
 target="_blank" rel="noopener">stock-analyzer</a> · 不构成投资建议</div>
 </body>
 </html>
