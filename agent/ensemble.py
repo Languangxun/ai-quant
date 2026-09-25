@@ -219,11 +219,18 @@ class EnsembleDecision:
 
         good = [v for v in votes if v["ok"]]
         if not good:
+            # 全部模型失败：保持当前仓位（不能给 0，避免下游误判为清仓）
+            cur = 0.0
+            if callable(position_of):
+                try:
+                    cur = float(position_of("半导体") or 0.0)
+                except Exception:
+                    cur = 0.0
             return create_decision(
-                "HOLD", "半导体", 0.0, 0.0,
+                "HOLD", "半导体", cur, 0.0,
                 "所有模型均失败，保持观望", "模型不可用",
                 source="ensemble",
-                current_position=0.0,
+                current_position=cur,
             ), votes
 
         positions = [v["decision"].target_position for v in good]

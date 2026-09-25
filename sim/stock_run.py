@@ -23,6 +23,8 @@ import time
 from datetime import datetime
 
 from trading.calendar import TradingCalendar
+from trading.instruments import MarketModel
+from trading.orders import OrderJournal
 from trading.stock_account import StockAccount
 from trading.stock_executor import StockExecutor
 from data.stock import cli_bridge as bridge
@@ -32,6 +34,7 @@ from sim import intraday
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_PATH = os.path.join(BASE_DIR, "sim", "state", "stock_account.json")
+JOURNAL_PATH = os.path.join(BASE_DIR, "sim", "state", "order_journal.jsonl")
 LOG_PATH = os.path.join(BASE_DIR, "logs", "sim.log")
 INBOX_DIR = os.path.join(BASE_DIR, "memory", "inbox")
 
@@ -187,12 +190,15 @@ def main(argv=None):
               f"（config/stock.yaml capital 或 --capital 可配）")
 
     account = load_account(args.state, args.capital, cfg)
+    market = MarketModel(cfg)
+    journal = OrderJournal(JOURNAL_PATH) if not args.dry_run else OrderJournal()
     executor = StockExecutor(
         account, calendar=calendar,
         max_positions=cfg["max_positions"],
         max_position_pct=cfg["max_position_pct"],
         min_order_amount=cfg["min_order_amount"],
         min_order_pct=cfg.get("min_order_pct", 5.0),
+        market=market, journal=journal,
     )
 
     daily_path = os.path.join(
@@ -214,10 +220,16 @@ def main(argv=None):
         min_price=cfg["universe"]["min_price"],
         recent_days=cfg["universe"]["recent_days"],
         risk_mode=args.mode_risk,
+        include_etf=cfg["universe"].get("include_etf", False),
+        etf_min_price=cfg["universe"].get("etf_min_price", 0.5),
+        etf_max_scan=cfg["universe"].get("etf_max_scan", 30),
     )
-    print(f"候选 {len(cands)} 只（{time.time() - t0:.0f}s）")
+    print(f"候选 {len(cands)} 只"
+          f"（含 ETF {sum(1 for c in cands if c.get('kind') == 'etf')}）"
+          f"（{time.time() - t0:.0f}s）")
     codes = [c["code"] for c in cands] + account.position_codes()
     quotes = live_prices(list(dict.fromkeys(codes)))
+    names = {c: q.get("name") or "" for c, q in quotes.items()}
     prices = {c: q["price"] for c, q in quotes.items() if q.get("price")}
     prev_closes = {c: q.get("prev_close") for c, q in quotes.items()}
     for c in cands:
@@ -239,8 +251,10 @@ def main(argv=None):
         cost = (sum(l.cost * l.shares for l in account.lots[code])
                 / max(1, shares))
         px = prices.get(code, 0)
+        inst = market.classify(code, names.get(code, ""))
         positions.append({
-            "code": code, "shares": shares, "cost": round(cost, 4),
+            "code": code, "name": inst.name, "kind": inst.kind,
+            "t0": inst.t0, "shares": shares, "cost": round(cost, 4),
             "price": px,
             "pnl_pct": round((px / cost - 1) * 100, 2) if cost else 0.0,
             "pct": round(account.position_pct(code, prices), 2),
@@ -312,7 +326,8 @@ def main(argv=None):
                 continue
         if args.dry_run:
             continue
-        t = executor.execute_order(o, prices, str(trade_date), prev_closes)
+        t = executor.execute_order(o, prices, str(trade_date), prev_closes,
+                                   names=names, session=stamp)
         print(f"  执行 {o.get('code')}: {t if not hasattr(t, 'to_dict') else t.to_dict()}")
         if hasattr(t, "to_dict"):
             trades.append(t)
@@ -331,7 +346,8 @@ def main(argv=None):
         "skipped": skipped,
     }
     candidates_out = [
-        {k: c[k] for k in ("code", "name", "score", "chg", "price") if k in c}
+        {k: c[k] for k in ("code", "name", "kind", "score", "chg", "price")
+         if k in c}
         for c in context.get("candidates", [])[:20]
     ]
     summary = intraday.merge_summary(

@@ -21,6 +21,7 @@ CLI_DIR = os.path.join(BASE_DIR, "scripts", "cli")
 CLI_PATH = os.path.join(CLI_DIR, "stock_predict.py")
 DB_PATH = os.path.join(CLI_DIR, "stock_cache.db")
 UNIVERSE_CACHE = os.path.join(BASE_DIR, "sim", "state", "universe_cache.json")
+UNIVERSE_CACHE_VERSION = 2      # v2：股票池含 ETF/LOF（旧缓存自动失效重扫）
 
 _cli = None
 
@@ -145,8 +146,6 @@ def _scan_universe():
         if code.startswith(("sh000", "sz399")):     # 指数（上证/深证等）
             continue
         name, industry, mktcap = info.get(code, ("", "", 0.0))
-        if industry == "ETF" or is_etf(code):
-            continue
         if code.startswith("bj"):
             continue
         if "ST" in name.upper() or "退" in name:
@@ -160,6 +159,8 @@ def _load_universe_cache():
     try:
         with open(UNIVERSE_CACHE, encoding="utf-8") as f:
             d = json.load(f)
+        if d.get("version") != UNIVERSE_CACHE_VERSION:
+            return None
         return d if d.get("latest") and d.get("rows") else None
     except Exception:
         return None
@@ -170,7 +171,8 @@ def _save_universe_cache(latest, rows):
         os.makedirs(os.path.dirname(UNIVERSE_CACHE), exist_ok=True)
         tmp = UNIVERSE_CACHE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"latest": latest, "ts": time.time(), "rows": rows},
+            json.dump({"version": UNIVERSE_CACHE_VERSION, "latest": latest,
+                       "ts": time.time(), "rows": rows},
                       f, ensure_ascii=False)
         os.replace(tmp, UNIVERSE_CACHE)
     except OSError:
@@ -179,12 +181,16 @@ def _save_universe_cache(latest, rows):
 
 def universe(min_bars=400, recent_days=15, exclude_etf=True,
              exclude_bj=True, min_price=2.0, max_scan=None, boards="all",
-             refresh=False):
+             refresh=False, include_etf=False, etf_min_price=0.5,
+             etf_max_scan=30):
     """股票池 [(code, name, industry, mktcap)]，按市值降序（无市值的排后）。
 
     boards="main" 只保留沪深主板（sh60/sz00），剔除创业板/科创板/北交所。
-    首次扫描慢（Pi ~90s），结果缓存到 sim/state/universe_cache.json，
-    DB 最新日期不变时后续调用秒开；refresh=True 强制重扫。
+    include_etf=True 时纳入 ETF/LOF（用 etf_min_price 单独过滤低价），
+    并给 ETF 独立配额 etf_max_scan，避免被大市值股票挤出 max_scan；
+    exclude_etf=False 为旧行为（不设配额）。首次扫描慢（Pi ~90s），结果
+    缓存到 sim/state/universe_cache.json，DB 最新日期不变时后续调用秒开；
+    refresh=True 强制重扫。
     """
     latest = latest_date()
     if not latest:
@@ -200,29 +206,41 @@ def universe(min_bars=400, recent_days=15, exclude_etf=True,
         "%Y-%m-%d", time.localtime(
             time.mktime(time.strptime(latest, "%Y-%m-%d"))
             - int(recent_days) * 86400))
-    out = []
+    stocks, etfs = [], []
     for code, name, industry, mktcap, close, last, cnt in cache["rows"]:
         if cnt < min_bars or last < cutoff:
             continue
-        if exclude_etf and industry == "ETF":
+        is_etf_code_ = is_etf(code)
+        etf_like = is_etf_code_ or industry == "ETF"
+        if etf_like and exclude_etf and not include_etf:
             continue
         if exclude_bj and code.startswith("bj"):
             continue
         if boards == "main" and not code.startswith(("sh60", "sz00")):
             continue
-        if close < min_price:
+        if close < (etf_min_price if is_etf_code_ else min_price):
             continue
-        out.append((code, name, industry, mktcap))
+        (etfs if etf_like else stocks).append(
+            (code, name, industry, mktcap))
+    stocks.sort(key=lambda x: -x[3])
+    if include_etf:
+        etfs.sort(key=lambda x: -x[3])
+        out = stocks[:max_scan] if max_scan else stocks
+        return out + etfs[:max(0, int(etf_max_scan))]
+    out = stocks + etfs
     out.sort(key=lambda x: -x[3])
     return out[:max_scan] if max_scan else out
 
 
 def candidates(top_n=30, max_scan=300, min_bars=400, min_price=2.0,
-               recent_days=15, risk_mode="稳健"):
+               recent_days=15, risk_mode="稳健", include_etf=False,
+               etf_min_price=0.5, etf_max_scan=30):
     """每日候选：缓存扫描 + daily_pick_score 排名（口径同 CLI daily_picks）。"""
     cli = load()
     codes = universe(min_bars=min_bars, recent_days=recent_days,
-                     min_price=min_price, max_scan=max_scan)
+                     min_price=min_price, max_scan=max_scan,
+                     include_etf=include_etf, etf_min_price=etf_min_price,
+                     etf_max_scan=etf_max_scan)
     try:
         ind5_map, ind5_med, ind5_lead = cli._picks_ind_ctx()
     except Exception:
@@ -251,6 +269,7 @@ def candidates(top_n=30, max_scan=300, min_bars=400, min_price=2.0,
         chg = (rows[-1]["close"] / prev - 1) * 100 if prev else 0.0
         picks.append({
             "code": code, "name": name, "industry": industry,
+            "kind": "etf" if is_etf(code) else "stock",
             "close": rows[-1]["close"], "chg": round(chg, 2),
             "score": score, "reasons": " ".join(reasons) or "-",
             "band": band, "mktcap": mktcap,

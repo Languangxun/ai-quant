@@ -19,8 +19,8 @@ import re
 import time
 from datetime import datetime
 
+from trading.instruments import MarketModel
 from trading.stock_account import StockAccount
-from trading.stock_executor import price_limit_pct
 from data.stock import cli_bridge as bridge
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,7 +44,8 @@ def result_markdown(result):
         f"{s.get('range', ['?', '?'])[1]}（{s.get('days', 0)} 个交易日）",
         f"- 参数：风险档 **{cfg.get('risk_mode')}**，最多 "
         f"{cfg.get('max_positions')} 只，单票 ≤{cfg.get('max_position_pct')}%，"
-        f"成交价 {cfg.get('exec_px')}，止损 {cfg.get('stop')}",
+        f"成交价 {cfg.get('exec_px')}，止损 {cfg.get('stop')}，"
+        f"标的池 {'股票+ETF' if cfg.get('include_etf') else '股票'}",
         "",
         "## 总体指标",
         "",
@@ -112,9 +113,18 @@ class StockBacktest:
     def __init__(self, capital=None, risk_mode=None, max_positions=None,
                  max_position_pct=None, min_order_amount=None,
                  exec_px=None, check_limit=True, min_bars=None,
-                 start=None, end=None, limit=0, boards=None, progress=print):
+                 start=None, end=None, limit=0, boards=None, progress=print,
+                 include_etf=None):
         cfg = _load_cfg()
         self.cfg = cfg
+        self.market = MarketModel(cfg)
+        self.include_etf = bool(
+            (cfg.get("universe") or {}).get("include_etf", False)
+            if include_etf is None else include_etf)
+        self.etf_min_price = float(
+            (cfg.get("universe") or {}).get("etf_min_price", 0.5))
+        self.etf_max_scan = int(
+            (cfg.get("universe") or {}).get("etf_max_scan", 30))
         self.capital = float(capital or cfg.get("backtest", {}).get("capital")
                              or cfg["capital"])
         self.risk_mode = risk_mode or cfg.get("risk_mode", "稳健")
@@ -153,12 +163,14 @@ class StockBacktest:
     # ---------- 第一遍：扫描信号 + 基准 ----------
 
     def scan(self):
-        codes = bridge.universe(min_bars=self.min_bars, boards=self.boards)
-        if self.limit:
-            codes = codes[:self.limit]
+        codes = bridge.universe(min_bars=self.min_bars, boards=self.boards,
+                                max_scan=self.limit or None,
+                                include_etf=self.include_etf,
+                                etf_min_price=self.etf_min_price,
+                                etf_max_scan=self.etf_max_scan)
         total = len(codes)
         self.progress(f"股票池 {total} 只（min_bars={self.min_bars}, "
-                      f"boards={self.boards}）")
+                      f"boards={self.boards}, include_etf={self.include_etf}）")
         t0 = time.time()
         n_sig = 0
         for k, (code, name, industry, mktcap) in enumerate(codes):
@@ -242,7 +254,7 @@ class StockBacktest:
 
     # ---------- 持仓辅助 ----------
 
-    def _load_held(self, code, entry_price, signal_date):
+    def _load_held(self, code, entry_price, signal_date, name=""):
         rows = bridge.db_rows(code)
         self.held[code] = {
             "rows": rows,
@@ -251,6 +263,7 @@ class StockBacktest:
             "entry": entry_price,
             "highest": entry_price,
             "signal_date": signal_date,
+            "inst": self.market.classify(code, name),
             "atr": bridge.atr(rows),
         }
 
@@ -319,9 +332,12 @@ class StockBacktest:
             if avail <= 0:
                 continue
             px = o if (o and o <= trail_stop) else trail_stop
+            inst = h.get("inst") or self.market.classify(code)
             try:
-                t = self.account.sell(code, px, avail, day,
-                                      reason="ATR跟踪止损")
+                t = self.account.sell(
+                    code, px, avail, day, reason="ATR跟踪止损",
+                    stamp_tax_rate=(None if inst.stamp_tax else 0.0),
+                    transfer_fee_rate=(None if inst.transfer_fee else 0.0))
                 self.trades.append(t.to_dict())
             except ValueError:
                 continue
@@ -342,15 +358,19 @@ class StockBacktest:
             r = self._row_on(code, day)
             if not r or not r["close"]:
                 continue
+            inst = self.held[code].get("inst") or self.market.classify(code)
             if self._limit_blocked(code, "SELL", r["close"],
-                                   self._prev_close(code, day)):
+                                   self._prev_close(code, day),
+                                   name=inst.name):
                 continue
             avail = self.account.available_shares(code, day)
             if avail <= 0:
                 continue
             try:
-                t = self.account.sell(code, r["close"], avail, day,
-                                      reason=reason)
+                t = self.account.sell(
+                    code, r["close"], avail, day, reason=reason,
+                    stamp_tax_rate=(None if inst.stamp_tax else 0.0),
+                    transfer_fee_rate=(None if inst.transfer_fee else 0.0))
                 self.trades.append(t.to_dict())
                 self.held.pop(code, None)
             except ValueError:
@@ -366,8 +386,9 @@ class StockBacktest:
             px = self._exec_price(code, day)
             if not px:
                 continue
+            inst = self.market.classify(code, name)
             if self._limit_blocked(code, "BUY", px,
-                                   self._prev_close(code, day)):
+                                   self._prev_close(code, day), name=name):
                 continue
             prices = self._close_prices(day)
             prices[code] = px
@@ -375,16 +396,21 @@ class StockBacktest:
             cap = total * self.max_position_pct / 100.0
             amount = min(total / self.max_positions, cap,
                          self.account.cash)
-            shares = self.account.max_buy_shares(px, cash=amount)
+            shares = self.account.max_buy_shares(
+                px, cash=amount,
+                transfer_fee_rate=(None if inst.transfer_fee else 0.0))
             floor_amt = min(self.min_order_amount,
                             total * self.min_order_pct / 100.0)
             if shares <= 0 or shares * px < floor_amt:
                 continue
             try:
-                t = self.account.buy(code, px, shares, day, self._next_day(day),
-                                     reason=reason)
+                t = self.account.buy(
+                    code, px, shares, day,
+                    self._sellable_date(day, inst),
+                    reason=reason,
+                    transfer_fee_rate=(None if inst.transfer_fee else 0.0))
                 self.trades.append(t.to_dict())
-                self._load_held(code, px, day)
+                self._load_held(code, px, day, name)
             except ValueError:
                 continue
 
@@ -412,11 +438,14 @@ class StockBacktest:
             return day
         return dates[i + 1] if i + 1 < len(dates) else day
 
-    def _limit_blocked(self, code, side, price, prev_close):
+    def _sellable_date(self, day, inst):
+        return day if inst.t0 else self._next_day(day)
+
+    def _limit_blocked(self, code, side, price, prev_close, name=""):
         if not self.check_limit or not prev_close or prev_close <= 0:
             return False
         chg = price / prev_close - 1.0
-        lim = price_limit_pct(code)
+        lim = self.market.classify(code, name).limit_pct
         if side == "BUY" and chg >= lim - 0.002:
             return True
         if side == "SELL" and chg <= -lim + 0.002:
@@ -481,6 +510,7 @@ class StockBacktest:
                 "exec_px": self.exec_px,
                 "stop": self.stop_cfg,
                 "min_bars": self.min_bars,
+                "include_etf": self.include_etf,
             },
         }
 
