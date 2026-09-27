@@ -118,7 +118,7 @@ def setup_logging():
 setup_logging()
 
 # 应用版本号（回测产物目录/关于/UA 共用；2026-09-26 升 6.1.5）
-APP_VERSION = "6.1.5"
+APP_VERSION = "6.1.6"
 
 
 # ---- 缓存/拉取统计：定期汇总，回答"缓存够新为何还联网" ----
@@ -191,8 +191,9 @@ _BG_EX = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bg")
 
 class CFG:
     """集中调参（原散落各处的魔数收敛于此；模块级别名保持兼容）。"""
-    W_WINDOW = 20                       # 形态匹配窗口长度（扫描：W20 IC+0.016
-                                        # vs W10≈0，两次独立一致，自适应兼容短历史）
+    W_WINDOW = 20                       # 形态匹配窗口长度（小样本扫描 W20 略优；
+                                        # 全市场样本外 L1 增量≈0，见 README 研究
+                                        # 结论——勿据样本内 IC 调参）
     TOPK = 10                           # Top-K 相似样本数（显示用）
     CANDIDATE_TOPK = 50                 # 候选样本数（扩大后再筛选）
     LV_W = {"L1": 0.6, "L2": 0.3, "L3": 0.1}    # 三级样本池权重
@@ -208,12 +209,24 @@ class CFG:
     MAX_FETCH_BARS = 1000
     # 后台主动预取未分析个股K线（样本池优先→全库滚动；ini [predict] auto_prefetch=0 关）
     AUTO_PREFETCH = True
+    # 筹码峰右列（同花顺式，v6.1.5 热修⑧）：显示宽度占画布比例（非紧凑屏生效）
+    # + 右侧价格条宽度（留给十字光标价格标签，筹码柱向左生长不压住它）
+    CHIP_W_RATIO = 0.17
+    CHIP_AXIS_STRIP = 36
+    # 筹码分布算法（显示口径，v6.1.5 热修⑧）：
+    # 价格桶数 + 换手衰减系数。衰减系数 × 当日换手率（有市值时用真实换手
+    # =量×100/总股本，缺市值退回 量/中位量×2% 启发式）；0.5 与同花顺
+    # 002241 剖面（现价上下筹码≈50/50）对齐——1.0 时老筹码消失过快、
+    # 现价上方只剩 ~32%。信号引擎（chip_snapshots/_chip_feats_py）不随此处变化。
+    CHIP_NBIN = 360
+    CHIP_DECAY_SCALE = 0.5
     
     # 样本质量筛选与加权参数
     SIMILARITY_WEIGHTING = False        # 指数相似度加权（消融回测证实拖后腿：
                                         # 关闭后 命中50.4%→52.4%, IC -0.043→+0.020）
     QUALITY_FILTER = True               # 是否启用样本质量筛选
-    MAX_DAILY_CHANGE = 10.0             # 单日涨跌停阈值(%) - 超过视为异常
+    # 注：原 MAX_DAILY_CHANGE=10 已删除（死常数、且不区分板块涨跌停；
+    # 清洗层/回测层另有按板块的涨跌停判定，见 _limit_pct/_v4_limit_pct）
     MIN_SAMPLES_REQUIRED = 3            # 最少样本数要求 - 少于则降低置信度
     SIMILARITY_CUTOFF = 2.5             # 相似度截断阈值 - 超过则降低权重
     TIME_DECAY_ENABLED = True           # 是否启用时间衰减
@@ -306,6 +319,8 @@ def _load_predict_cfg():
         CFG.W_WINDOW = gi("w_window", CFG.W_WINDOW, 5, 30)
         CFG.TOPK = gi("topk", CFG.TOPK, 3, 30)
         CFG.CANDIDATE_TOPK = gi("candidate_topk", CFG.CANDIDATE_TOPK, 10, 100)
+        # 漏斗一致性：候选样本数不得小于最终样本数（否则筛选后取不满/参数打架）
+        CFG.CANDIDATE_TOPK = max(CFG.CANDIDATE_TOPK, CFG.TOPK)
         CFG.TIME_DECAY_DAYS = gi("time_decay_days", CFG.TIME_DECAY_DAYS,
                                  0, 1095)
         CFG.TIME_DECAY_RATE = gf("time_decay_rate", CFG.TIME_DECAY_RATE,
@@ -1083,6 +1098,64 @@ _tx_raw_cache = {}
 _LAST_RAW = {}
 
 
+_SINA_FQ_CACHE = {}
+
+
+def _sina_hfq_factors(full):
+    """新浪后复权因子 [(date,factor)] 升序；无数据返回 []；解析失败抛异常。
+
+    v6.1.5 热修⑪：腾讯 hfq 实测为分段仿射 `hfq≈a×不复权价+b`，段内日收益
+    被缩放（浦发 0.63/茅台 0.82/申华 1.75），不能作为收益口径。新浪
+    `/realstock/company/<code>/hfq.js` 给出乘法累计因子，×不复权日K 才是真
+    后复权（段内收益=不复权收益、除权日按因子跳变）。"""
+    if full in _SINA_FQ_CACHE:
+        return _SINA_FQ_CACHE[full]
+    import re
+    url = ("https://finance.sina.com.cn/realstock/company/"
+           f"{full}/hfq.js")
+    txt = _http_get(url, retries=2, timeout=15, decode="utf-8",
+                    headers={"Referer": "https://finance.sina.com.cn/"})
+    m = re.search(r"=\s*(\{.*\})", txt, re.S)
+    if not m:
+        raise RuntimeError("新浪复权因子解析失败")
+    data = (json.loads(m.group(1)).get("data") or [])
+    ev = sorted((it["d"], float(it["f"])) for it in data if it.get("d"))
+    _SINA_FQ_CACHE[full] = ev
+    return ev
+
+
+def _apply_hfq_factors(rows, factors):
+    """不复权 rows × 因子 → 后复权 rows（价×f，量不变）。"""
+    import bisect
+    ds = [d for d, _ in factors]
+    fs = [f for _, f in factors]
+    out = []
+    for r in rows:
+        i = bisect.bisect_right(ds, r["date"]) - 1
+        f = fs[i] if i >= 0 else fs[0]
+        out.append({"date": r["date"], "open": r["open"] * f,
+                    "close": r["close"] * f, "high": r["high"] * f,
+                    "low": r["low"] * f, "vol": r["vol"]})
+    return out
+
+
+def _fetch_tencent_mul(full, count=600, host=None, page=800):
+    """腾讯不复权 + 新浪因子 = 真乘法后复权（替代腾讯 hfq 仿射口径）。
+
+    ETF/LOF 新浪无有效因子 → 退腾讯 qfq（日收益同样与不复权一致）；
+    指数/无事件个股 → 不复权即后复权。新浪因子不可得时抛异常，
+    调用方保留本地缓存，绝不回写仿射 hfq。"""
+    rows = _fetch_tencent(full, count=count, host=host, fq="")
+    if not rows:
+        return []
+    factors = _sina_hfq_factors(full)
+    if any(abs(f - 1.0) > 1e-9 for _, f in factors):
+        return _apply_hfq_factors(rows, factors)
+    if _is_etf(full):
+        return _fetch_tencent(full, count=count, host=host, fq="qfq") or rows
+    return rows
+
+
 def _tx_quote_raw(qt):
     """从腾讯若快照 qt 里取最新原始价（不复权）。"""
     if not isinstance(qt, dict):
@@ -1302,19 +1375,19 @@ def _fetch_remote_rows(full, count=600, info=None):
        选冷却结束最早的源强行试一次，成功即重置熔断；
     3. 单次调用内只对一个源做至多2次限流重试，
        失败立刻切下一源，避免整体请求被单源拖死。
-    info：可选 dict，返回实际命中源（info["src"]）与尝试序列（info["tries"]）。"""
-        # 注意：只使用后复权(hfq)源。163/新浪只提供不复权(或减法前复权)，
-    # 与库内后复权口径混用会产生假跳变，不再作为持久化源。
+    info：可选 dict，返回实际命中源（info["src"]）与尝试序列（info["tries"]）。
+    口径（v6.1.5 热修⑪）：腾讯只作为**不复权**源，落库前乘新浪后复权因子；
+    腾讯 hfq 是仿射失真口径，不再直接入库。东财仅作最后兜底。"""
     sources = [
-        ("腾讯", lambda: _fetch_tencent(full, count)),
-        ("腾讯代理", lambda: _fetch_tencent(
+        ("腾讯", lambda: _fetch_tencent_mul(full, count)),
+        ("腾讯代理", lambda: _fetch_tencent_mul(
             full, count,
             "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/"
             "fqkline/get")),
-        ("腾讯ifzq", lambda: _fetch_tencent(
+        ("腾讯ifzq", lambda: _fetch_tencent_mul(
             full, count,
             "https://ifzq.gtimg.cn/appstock/app/fqkline/get")),
-        ("腾讯HTTP", lambda: _fetch_tencent(
+        ("腾讯HTTP", lambda: _fetch_tencent_mul(
             full, count,
             "http://ifzq.gtimg.cn/appstock/app/fqkline/get")),
         ("东财", lambda: _fetch_eastmoney(full, count)),
@@ -1790,10 +1863,16 @@ _BF_TX_I = [0]
 _BF_PAUSE = [0.0, 0]            # [暂停截止时间, 连续限流次数]
 
 
-def _bf_tx_fetch(full, end, count):
-    """腾讯K线单页（后复权 hfq）：三域名轮换，全部501才抛（触发全局暂停）。"""
-    param = (f"?param={full},day,,{end},{count},hfq" if end
-             else f"?param={full},day,,,{count},hfq")
+def _bf_tx_fetch(full, end, count, fq="hfq"):
+    """腾讯K线单页（fq=hfq/qfq/''）：三域名轮换，全部失败才抛（触发全局暂停）。
+
+    不复权（fq=''）翻页必须带 end 参数与空复权位（v6.1.5 热修⑪）。"""
+    if fq:
+        param = (f"?param={full},day,,{end},{count},{fq}" if end
+                 else f"?param={full},day,,,{count},{fq}")
+    else:
+        param = (f"?param={full},day,,{end},{count}," if end
+                 else f"?param={full},day,,,{count},")
     last = None
     for k in range(len(_BF_TX_HOSTS)):
         u = _BF_TX_HOSTS[(_BF_TX_I[0] + k) % len(_BF_TX_HOSTS)]
@@ -1801,8 +1880,8 @@ def _bf_tx_fetch(full, end, count):
             txt = _http_get(u + param, decode="utf-8", retries=1, timeout=8)
             _BF_TX_I[0] = (_BF_TX_I[0] + k + 1) % len(_BF_TX_HOSTS)
             d = (json.loads(txt).get("data") or {}).get(full) or {}
-            # 请求的是 hfq（后复权），腾讯返回 hfqday；指数无复权返回 day
-            bars = d.get("hfqday") or d.get("day") or []
+            key = {"hfq": "hfqday", "qfq": "qfqday"}.get(fq, "day")
+            bars = d.get(key) or d.get("day") or []
             out = []
             for b in bars:
                 try:
@@ -1819,31 +1898,55 @@ def _bf_tx_fetch(full, end, count):
     raise last
 
 
-def _bf_fetch_one(full, page=800, target=None):
-    """单只：腾讯翻页为主源（后复权），东财全量兜底。返回 (rows, raw_last)。
-
-    target: 目标根数（默认 max(CFG.MAX_FETCH_BARS, 2页)）；按需继续翻页直到
-    达到目标或源侧没有更早数据（2000 根需 3 页）。"""
+def _bf_tx_pages(full, page=800, target=None, fq="hfq", max_pages=6):
+    """腾讯深历史按需翻页（fq='' 不复权 / 'hfq' / 'qfq'）。"""
     import datetime
     target = target or max(CFG.MAX_FETCH_BARS, page * 2)
-    rows1 = _bf_tx_fetch(full, "", page)
-    if not rows1:
-        raise RuntimeError("腾讯空数据")
-    have = {r["date"] for r in rows1}
+    rows = _bf_tx_fetch(full, "", page, fq)
     pages = 1
-    while len(rows1) < target and pages < 5 and len(rows1) >= page - 10:
-        d0 = datetime.date.fromisoformat(rows1[0]["date"])
+    have = {r["date"] for r in rows}
+    while (rows and len(rows) < target and pages < max_pages
+           and len(rows) >= page - 10):
+        d0 = datetime.date.fromisoformat(rows[0]["date"])
         end = (d0 - datetime.timedelta(days=1)).isoformat()
         try:
-            older = _bf_tx_fetch(full, end, page)
+            older = _bf_tx_fetch(full, end, page, fq)
         except Exception:
             break                               # 更早一页失败就保留已有
         new = [r for r in older if r["date"] not in have]
         if not new:
             break                               # 源侧已无更早数据
-        rows1 = new + rows1
+        rows = new + rows
         have.update(r["date"] for r in new)
         pages += 1
+    return rows
+
+
+def _to_hfq_mul(full, raw, page=800, target=None):
+    """不复权 rows → 真乘法后复权。
+
+    有新浪因子（个股）→ raw×因子；ETF/LOF 无有效因子 → 腾讯 qfq（日收益
+    同样保真）；指数/无除权事件个股 → 不复权即后复权。因子不可得时抛异常，
+    调用方保留原数据，绝不回写腾讯 hfq 仿射口径（v6.1.5 热修⑪）。"""
+    factors = _sina_hfq_factors(full)
+    if any(abs(f - 1.0) > 1e-9 for _, f in factors):
+        return _apply_hfq_factors(raw, factors)
+    if _is_etf(full):
+        q = _bf_tx_pages(full, page=page, target=target, fq="qfq")
+        return q or raw
+    return raw
+
+
+def _bf_fetch_one(full, page=800, target=None):
+    """单只：腾讯**不复权**翻页 → 新浪因子得真乘法后复权；东财兜底。
+
+    target: 目标根数（默认 max(CFG.MAX_FETCH_BARS, 2页)）。v6.1.5 热修⑪：
+    此前直接存腾讯 hfq（仿射失真，日收益被逐股缩放），改走乘法口径。"""
+    target = target or max(CFG.MAX_FETCH_BARS, page * 2)
+    raw = _bf_tx_pages(full, page=page, target=target, fq="")
+    if not raw:
+        raise RuntimeError("腾讯空数据")
+    rows1 = _to_hfq_mul(full, raw, page=page, target=target)
     if len(rows1) >= 300:
         return rows1, _raw_last_price(full)
     try:
@@ -2042,29 +2145,35 @@ def clean_daily_db(fix=True, progress=None):
             if progress and ci % 300 == 0:
                 progress(f"清洗扫描 {ci}/{len(by)}")
             n = len(bars)
+            name = names.get(c, "")
             bad = [b for b in bars if not _clean_bar_valid(b)]
             if bad:
                 issues.setdefault(c, []).append("bad")
                 stats["bad_bars"] += len(bad)
-            # 价格失真：末价过低（除权公式前复权长期做减法导致）
-            if bars and bars[-1][4] is not None and bars[-1][4] < 0.5:
-                issues.setdefault(c, []).append("refetch")
-                stats["refetch"] += 1
-                stats["low_price"] = stats.get("low_price", 0) + 1
-            flags = []
-            name = names.get(c, "")
-            for prev, cur in zip(bars, bars[1:]):
-                pc, cl = prev[4], cur[4]
-                lim = _limit_pct(c, name, cur[0])
-                if not pc or not cl or lim is None:
-                    flags.append(False)
-                    continue
-                flags.append(abs(cl / pc - 1) * 100 > lim + 3.0)
-            viol = any(flags) if not _is_etf(c) else any(
-                a and b for a, b in zip(flags, flags[1:]))
+            # 涨跌幅越界：统一走 _bars_anomalous（新股前10根/停牌复牌/指数/
+            # 退市整理/ST现名回溯/ETF折算全豁免），不再裸比涨跌停——旧规则
+            # 会把科创板ETF 20%涨跌与新股首日误判为坏数据（v6.1.5 热修⑪）
+            viol = _bars_anomalous(
+                [{"date": b[0], "close": b[4]} for b in bars], c, name)
             if viol:
                 issues.setdefault(c, []).append("refetch")
                 stats["refetch"] += 1
+            d1 = bars[-1][0]
+            try:
+                age = (_today - _dt.datetime.strptime(
+                    d1, "%Y-%m-%d").date()).days
+            except ValueError:
+                age = 0
+            if age > 180:
+                issues.setdefault(c, []).append(f"delisted:{d1}")
+                stats["delisted"] += 1
+            elif (bars[-1][4] is not None and bars[-1][4] < 0.5
+                  and not _is_etf(c) and "退" not in name
+                  and not c.startswith(("sh000", "sz399"))):
+                # 低价基金/退市整理股是真实价格；只对非ETF活跃股怀疑失真
+                issues.setdefault(c, []).append("refetch")
+                stats["refetch"] += 1
+                stats["low_price"] = stats.get("low_price", 0) + 1
             gaps = 0
             for a, b in zip(bars, bars[1:]):
                 try:
@@ -2076,15 +2185,6 @@ def clean_daily_db(fix=True, progress=None):
                     continue
             if gaps:
                 stats["suspend"] += 1
-            d1 = bars[-1][0]
-            try:
-                age = (_today - _dt.datetime.strptime(
-                    d1, "%Y-%m-%d").date()).days
-            except ValueError:
-                age = 0
-            if age > 180:
-                issues.setdefault(c, []).append(f"delisted:{d1}")
-                stats["delisted"] += 1
             run = 1
             for a, b in zip(bars, bars[1:]):
                 run = run + 1 if a[4] == b[4] and a[4] else 1
@@ -2109,13 +2209,25 @@ def clean_daily_db(fix=True, progress=None):
                 if ("refetch" in kinds_set or "stale" in kinds_set) \
                         and not c.startswith("bj"):
                     try:
-                        fresh, raw_last = _bf_fetch_one(c)
+                        old_n, old_first, old_last = conn.execute(
+                            "SELECT COUNT(*), MIN(date), MAX(date) "
+                            "FROM daily_bars WHERE code=?", (c,)).fetchone()
+                        # 迁移深度不缩水（v6.1.5 热修⑪）：旧版按设置（默认
+                        # 1600根）重拉会把 2400 根长历史截断
+                        fresh, raw_last = _bf_fetch_one(
+                            c, target=max(old_n or 0, 2400))
                         fd = [r for r in fresh
                               if r["date"] < time.strftime("%Y-%m-%d")]
-                        old_n = conn.execute(
-                            "SELECT COUNT(*) FROM daily_bars WHERE code=?",
-                            (c,)).fetchone()[0]
-                        if len(fd) >= 200 and len(fd) >= min(old_n, 400):
+                        ok = len(fd) >= 200
+                        if old_n:
+                            if (old_first and fd
+                                    and fd[0]["date"] > old_first
+                                    and len(fd) <= old_n):
+                                ok = False     # 首根变晚且没更长 → 丢头
+                            if (old_last and fd
+                                    and fd[-1]["date"] < old_last):
+                                ok = False     # 末根变旧 → 丢新
+                        if ok:
                             conn.execute(
                                 "DELETE FROM daily_bars WHERE code=?", (c,))
                             conn.executemany(
@@ -2128,6 +2240,8 @@ def clean_daily_db(fix=True, progress=None):
                             if raw_last and fd[-1]["close"] > 0:
                                 _set_adjust(c, raw_last / fd[-1]["close"])
                             stats["refetched"] += 1
+                        else:
+                            stats["kept"] = stats.get("kept", 0) + 1
                     except Exception:
                         pass            # 源不可用时保留原数据，下次再修
                 dl = next((k.split(":", 1)[1] for k in kinds
@@ -3264,9 +3378,15 @@ def calc_rsi(closes, n):
     return out
 
 
-def calc_chips(rows, cur_price=None, nbin=120):
+def calc_chips(rows, cur_price=None, nbin=None, shares=None):
     """筹码分布：逐日按换手衰减历史筹码，当日成交量在[低,高]区间均匀摊分。
-    无流通股本数据，换手率用 量/中位量*2% 启发式近似（限幅）。"""
+
+    换手率：shares（总股本，股）给定时用真实换手 = 成交量(手)*100/shares；
+    否则退回 量/中位量*2% 启发式（限幅）。两者再乘 CFG.CHIP_DECAY_SCALE
+    （v6.1.5 热修⑧：0.5 与同花顺剖面形状对齐——1.0 时老筹码消失过快）。
+    nbin 默认 CFG.CHIP_NBIN=360：全历史价格区间下可见窗口约 120+ 桶、柱距 ~3px
+    （信号引擎 chip_snapshots/_chip_feats_py 各自用 80/200 桶，不随此处变化）。"""
+    nbin = int(nbin or CFG.CHIP_NBIN)
     bars = [r for r in rows
             if r.get("vol") and r.get("low") and r["low"] > 0
             and r["high"] >= r["low"]]
@@ -3279,8 +3399,15 @@ def calc_chips(rows, cur_price=None, nbin=120):
     step = (hi_p - lo_p) / nbin
     chips = [0.0] * (nbin + 1)
     med_vol = sorted(r["vol"] for r in bars)[len(bars) // 2] or 1.0
+    scale = max(0.05, float(getattr(CFG, "CHIP_DECAY_SCALE", 0.5)))
+    use_shares = bool(shares and shares > 0)
     for r in bars:
-        t = min(0.20, max(0.002, 0.02 * (r["vol"] / med_vol)))
+        if use_shares:
+            t = min(0.35, max(0.0005,
+                             (r["vol"] * 100.0 / shares) * scale))
+        else:
+            t = min(0.20, max(0.002,
+                             0.02 * (r["vol"] / med_vol) * scale))
         chips = [c * (1.0 - t) for c in chips]
         b_lo = max(0, int((r["low"] - lo_p) / step))
         b_hi = min(nbin, int((r["high"] - lo_p) / step))
@@ -3308,31 +3435,19 @@ def calc_chips(rows, cur_price=None, nbin=120):
             p95 = m
             break
 
-    # 支撑/压力：在筹码分布中找“局部峰”（局部极大值），再取现价上下方
-    # 最密集的峰，作为支撑位/压力位。相比原“单根最密集bin”，局部峰能
-    # 避免选中噪声尖刺，且更贴近“最密集筹码峰”的语义。
-    def _peaks():
-        out = []
-        for k in range(1, nbin):
-            w = chips[k]
-            if w > chips[k - 1] and w >= chips[k + 1] and w > 0:
-                out.append((mids[k], w))
-        return out
-
+    # 支撑/压力：现价下方/上方“最密集的筹码带”。先做 3bin 平滑，
+    # 避免单 bin 噪声；不用“局部极大值”是因为现价切在主峰侧面时，
+    # 主力筹码带会落在下降坡上而非局部峰，反而被远处的小凸起压过
+    # （实测 002241：全历史口径 压力 27.33 只有 0.7% 筹码，而
+    # 24~25 元的厚筹码带被判为“非峰”）。
     def _strongest(below):
-        pk = _peaks()
-        if below:
-            cand = [(m, w) for m, w in pk if m < cur_price]
-        else:
-            cand = [(m, w) for m, w in pk if m > cur_price]
-        if not cand:
-            # 退化为最密集单bin（避免无峰时返回空）
-            best_w, best_m = -1.0, None
-            for w, m in zip(chips, mids):
-                if (m < cur_price) == below and w > best_w:
-                    best_w, best_m = w, m
-            return best_m
-        return max(cand, key=lambda x: x[1])[0]   # 最密集峰
+        sm = [(chips[max(0, k - 1)] + chips[k]
+               + chips[min(nbin, k + 1)]) / 3.0 for k in range(nbin + 1)]
+        best_w, best_m = -1.0, None
+        for k, m in enumerate(mids):
+            if (m < cur_price) == below and sm[k] > best_w:
+                best_w, best_m = sm[k], m
+        return best_m
 
     return {"bins": list(zip(mids, chips)),
             "avg_cost": round(avg_cost, 3), "profit": profit,
@@ -3979,6 +4094,11 @@ def daily_picks(progress=None, top_n=20, min_bars=120):
                 "SELECT code FROM delisted").fetchall()}
         except sqlite3.OperationalError:
             delisted = set()
+        try:                    # 显示缩放系数（hfq→乘法前复权，仙股过滤用）
+            adj = {r[0]: r[1] for r in conn.execute(
+                "SELECT code, k FROM adjust WHERE k>0").fetchall()}
+        except sqlite3.OperationalError:
+            adj = {}
     ind5_map, ind5_med, ind5_lead = _picks_ind_ctx()
     CH = 500
     cands = []
@@ -4002,7 +4122,9 @@ def daily_picks(progress=None, top_n=20, min_bars=120):
                   if len(r) >= min_bars and not _is_etf(c)
                   and not c.startswith('bj')          # 北交所K线源不支持
                   and c not in delisted               # 退市登记
-                  and r[-1]['close'] and r[-1]['close'] >= 2]   # 剔除仙股
+                  # 剔除仙股：库内是 hfq，须乘显示缩放 k 还原现价口径
+                  # （v6.1.5 热修⑩；原直接比较 hfq 值，阈值形同虚设）
+                  and (r[-1]['close'] or 0) * (adj.get(c) or 1.0) >= 2]
         if progress:
             progress(f"荐股载入 {min(i + CH, len(codes))}/{len(codes)}")
     picks = []
@@ -4042,6 +4164,716 @@ def daily_picks(progress=None, top_n=20, min_bars=120):
     if progress:
         progress(f"荐股完成：{len(picks)} 只入围，取Top{top_n}")
     return picks[:top_n]
+
+
+# ================= 18 策略综合荐股（v6.1.6，chaodi 引擎移植） =================
+# 语义与 chaodi_strategies/et_engine 一致（通达信口径，已逐策略对拍）：
+#   · 单次全市场扫描 → 每只股票按 18 策略过滤 → 各策略候选池内 min-max 归一化打分
+#   · 综合分 = 命中策略数 × 100 + 命中策略均分（共振优先，均分破同）
+# 数据层复用本地缓存：hfq × adjust.k = 乘法前复权（与三档面板同口径）；
+# 换手率优先取 et_shares（总股本），缺失退回 成交额/总市值；北交所不入池
+# （与样本池/研究口径一致）；ST/退市/次新/低价/低市值/低成交额走逐策略基础过滤
+# （趋势突破门槛更高：价 5~200 / 市值≥20亿 / 成交额≥1亿 / 次新 60 日）。
+CHD_MIN_BARS = 250
+CHD_LIMIT_BARS = 500
+CHD_BASIC = {
+    "price_min": 3.0, "price_max": 300.0,
+    "market_cap_min": 1_000_000_000.0,
+    "amount_min": 20_000_000.0,
+    "exclude_new_days": 30,
+}
+_CHD_BASIC_TREND = {**CHD_BASIC, "price_min": 5.0, "price_max": 200.0,
+                    "market_cap_min": 2_000_000_000.0,
+                    "amount_min": 100_000_000.0, "exclude_new_days": 60}
+_CHD_INDEX_PREFIX = ("sh000", "sh880", "sz399", "bj899")
+
+try:
+    from numpy.lib.stride_tricks import sliding_window_view as _chd_win
+except Exception:                                       # pragma: no cover
+    _chd_win = None
+try:
+    from scipy.signal import lfilter as _chd_lfilter
+except Exception:                                       # pragma: no cover
+    _chd_lfilter = None
+
+_SQRT252 = math.sqrt(252.0)
+
+
+# ---------------- 指标工具（TDX 口径） ----------------
+
+def _chd_shift(a, n=1):
+    out = np.full(len(a), np.nan)
+    if n < len(a):
+        out[n:] = a[:-n]
+    return out
+
+
+def _chd_ma(a, n):
+    out = np.full(len(a), np.nan)
+    if len(a) >= n:
+        cs = np.cumsum(np.insert(np.nan_to_num(a, nan=0.0), 0, 0.0))
+        out[n - 1:] = (cs[n:] - cs[:-n]) / n
+    return out
+
+
+def _chd_recur(a, alpha, y0=None):
+    """y[i] = alpha*x[i] + (1-alpha)*y[i-1]；y0=None 时首值取 x[0]。"""
+    a = np.asarray(a, dtype=np.float64)
+    n = len(a)
+    if n == 0:
+        return a.copy()
+    if _chd_lfilter is not None and not np.isnan(a).any():
+        zi = (1.0 - alpha) * (a[0] if y0 is None else y0)
+        y, _ = _chd_lfilter([alpha], [1.0, -(1.0 - alpha)], a, zi=[zi])
+        return y
+    out = np.full(n, np.nan)
+    prev = np.nan if y0 is None else y0
+    for i in range(n):
+        x = a[i]
+        if np.isnan(x):
+            continue
+        prev = x if np.isnan(prev) else alpha * x + (1 - alpha) * prev
+        out[i] = prev
+    return out
+
+
+def _chd_ema(a, n):
+    return _chd_recur(a, 2.0 / (n + 1.0))
+
+
+def _chd_rolling_std(a, n, ddof=1):
+    out = np.full(len(a), np.nan)
+    if len(a) >= n:
+        out[n - 1:] = _chd_win(a, n).std(axis=1, ddof=ddof)
+    return out
+
+
+def _chd_prev_extreme(a, n, kind="max"):
+    """前 n 根（不含当日）最大/最小值。"""
+    a = np.asarray(a, dtype=np.float64)
+    m = len(a)
+    out = np.full(m, np.nan)
+    if m < 2:
+        return out
+    acc = (np.maximum.accumulate(a) if kind == "max"
+           else np.minimum.accumulate(a))
+    upto = min(n, m)
+    out[1:upto] = acc[:upto - 1]
+    if m > n:
+        w = _chd_win(a, n)
+        out[n:] = (w[:m - n].max(axis=1) if kind == "max"
+                   else w[:m - n].min(axis=1))
+    return out
+
+
+def _chd_cross_up(a, b):
+    out = (a > b) & (_chd_shift(a, 1) <= _chd_shift(b, 1))
+    out[0] = False
+    return np.nan_to_num(out).astype(bool)
+
+
+def _chd_cross_dn(a, b):
+    out = (a < b) & (_chd_shift(a, 1) >= _chd_shift(b, 1))
+    out[0] = False
+    return np.nan_to_num(out).astype(bool)
+
+
+def _chd_limit_pct(code, name=""):
+    """涨跌幅限制（小数）：创业板/科创板 20%，北交所 30%，ST 5%，主板 10%。"""
+    code6 = code[2:] if code[:2] in ("sh", "sz", "bj") else code
+    if "ST" in (name or "").upper():
+        return 0.05
+    if code6.startswith(("300", "301", "688", "689")):
+        return 0.20
+    if code.startswith("bj") or code6.startswith(("92", "83", "87", "43")):
+        return 0.30
+    return 0.10
+
+
+def _chd_indicators(bars):
+    """18 策略所需指标（lite 子集）：MA/EMA/MACD/BOLL/RSI14/动量/波动/成交额。"""
+    o = bars["open"]
+    h = bars["high"]
+    low = bars["low"]
+    c = bars["close"]
+    v = bars["volume"]
+    n = len(c)
+    d = {"open": o, "high": h, "low": low, "close": c, "volume": v}
+    d["prev_close"] = _chd_shift(c, 1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        d["change_pct"] = c / d["prev_close"] - 1.0
+        d["amplitude"] = (h - low) / d["prev_close"]
+    for k in (5, 10, 20, 60):
+        d["ma%d" % k] = _chd_ma(c, k)
+    d["ema12"] = _chd_ema(c, 12)
+    d["ema26"] = _chd_ema(c, 26)
+    d["vol_ma5"] = _chd_ma(v, 5)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        d["vol_ratio_5d"] = v / d["vol_ma5"]
+    dif = d["ema12"] - d["ema26"]
+    d["macd_dif"] = dif
+    d["macd_dea"] = _chd_ema(dif, 9)
+    std20 = _chd_rolling_std(c, 20, ddof=1)
+    d["boll_mid"] = d["ma20"]
+    d["boll_upper"] = d["ma20"] + 2.0 * std20
+    d["boll_lower"] = d["ma20"] - 2.0 * std20
+    # RSI14（Wilder）
+    delta = np.full(n, np.nan)
+    delta[1:] = np.diff(c)
+    up = np.where(delta > 0, delta, 0.0)
+    dn = np.where(delta < 0, -delta, 0.0)
+    up[0] = dn[0] = np.nan
+    k = 14
+    au = np.full(n, np.nan)
+    ad = np.full(n, np.nan)
+    if n > k:
+        au[k] = np.nanmean(up[1:k + 1])
+        ad[k] = np.nanmean(dn[1:k + 1])
+        au[k + 1:] = _chd_recur(up[k + 1:], 1.0 / k, y0=au[k])
+        ad[k + 1:] = _chd_recur(dn[k + 1:], 1.0 / k, y0=ad[k])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rs = au / np.where(ad == 0, np.nan, ad)
+    d["rsi_14"] = 100.0 - 100.0 / (1.0 + rs)
+    # 动量
+    for k in (5, 20, 60):
+        with np.errstate(invalid="ignore", divide="ignore"):
+            d["momentum_%dd" % k] = c / _chd_shift(c, k) - 1.0
+    # 年化波动（20 日日收益 std ddof=1 × sqrt(252)）
+    ret = np.full(n, np.nan)
+    ret[1:] = c[1:] / c[:-1] - 1.0
+    av = np.full(n, np.nan)
+    if n >= 20:
+        av[19:] = np.nanstd(_chd_win(ret, 20), axis=1, ddof=1) * _SQRT252
+    d["annual_vol_20d"] = av
+    d["amount"] = v * 100.0 * c
+    return d
+
+
+def _chd_signals(ind, code, name):
+    c = ind["close"]
+    n = len(c)
+    lp = _chd_limit_pct(code, name)
+    ind["signal_ma_golden_5_20"] = _chd_cross_up(ind["ma5"], ind["ma20"])
+    ind["signal_macd_golden"] = _chd_cross_up(ind["macd_dif"], ind["macd_dea"])
+    ind["signal_ma20_breakout"] = _chd_cross_up(c, ind["ma20"])
+    ind["signal_boll_breakout_upper"] = c > ind["boll_upper"]
+    ind["signal_n_day_high"] = np.nan_to_num(
+        c >= _chd_prev_extreme(c, 60, "max")).astype(bool)
+    ind["signal_n_day_low"] = np.nan_to_num(
+        c <= _chd_prev_extreme(c, 60, "min")).astype(bool)
+    prev = ind["prev_close"]
+    up_price = np.round(prev * (1.0 + lp), 2)
+    limit_up = np.nan_to_num(c >= up_price - 1e-9).astype(bool)
+    limit_up[0] = False
+    ind["signal_limit_up"] = limit_up
+    streak = np.zeros(n, dtype=np.int64)
+    run = 0
+    for i in range(n):
+        run = run + 1 if limit_up[i] else 0
+        streak[i] = run
+    ind["consecutive_limit_ups"] = streak
+    ind["limit_pct"] = np.full(n, lp)
+    ind["turnover_rate"] = np.full(n, np.nan)
+    return ind
+
+
+def _chd_last_map(ind):
+    out = {}
+    for k, v in ind.items():
+        out[k] = v[-1] if isinstance(v, np.ndarray) else v
+    return out
+
+
+# ---------------- 18 策略定义（filter/scoring 与 chaodi 逐条一致） ----
+
+def _chd_p(p, key, dflt):
+    v = p.get(key, dflt)
+    return dflt if v is None else v
+
+
+def _chd_opt(cond, enabled):
+    return cond if enabled else True
+
+
+def _chd_and(*conds):
+    out = None
+    for c in conds:
+        out = c if out is None else (out & c)
+    return out
+
+
+def _chd_sig(ind, name):
+    return bool(ind[name])
+
+
+CHD_STRATEGIES = [
+    {"id": "boll_breakout", "name": "布林突破",
+     "scoring": {"vol_ratio_5d": 0.4, "change_pct": 0.3, "momentum_20d": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["close"] > ind["boll_upper"],
+                  _chd_p(p, "require_boll_breakout", True)),
+         _chd_opt(ind["vol_ratio_5d"] >= _chd_p(p, "vol_ratio_min", 1.5),
+                  _chd_p(p, "use_volume_filter", True)))},
+    {"id": "broken_board_recovery", "name": "断板反包",
+     "scoring": {"change_pct": 0.4, "vol_ratio_5d": 0.3, "momentum_5d": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(_chd_sig(ind, "signal_limit_up"),
+                  _chd_p(p, "require_limit_up", True)),
+         _chd_opt(ind["vol_ratio_5d"] >= _chd_p(p, "vol_ratio_min", 1.5),
+                  _chd_p(p, "use_volume_filter", True)),
+         _chd_opt(ind["change_pct"] > _chd_p(p, "change_pct_min", 0.03),
+                  _chd_p(p, "use_change_filter", True)))},
+    {"id": "bullish_alignment", "name": "均线多头",
+     "scoring": {"momentum_60d": 0.4, "momentum_20d": 0.3,
+                 "turnover_rate": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt((ind["ma5"] > ind["ma10"]) & (ind["ma10"] > ind["ma20"])
+                  & (ind["ma20"] > ind["ma60"]),
+                  _chd_p(p, "require_ma_alignment", True)),
+         _chd_opt(ind["momentum_20d"] > 0,
+                  _chd_p(p, "require_positive_momentum", True)))},
+    {"id": "consecutive_limit_ups", "name": "连板股",
+     "scoring": {"consecutive_limit_ups": 0.5, "change_pct": 0.3,
+                 "amount": 0.2},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(_chd_sig(ind, "signal_limit_up"),
+                  _chd_p(p, "require_limit_up", True)),
+         _chd_opt(ind["consecutive_limit_ups"] >= _chd_p(p, "min_boards", 2),
+                  _chd_p(p, "use_boards_filter", True)))},
+    {"id": "high_turnover_surge", "name": "高换手拉升",
+     "scoring": {"turnover_rate": 0.4, "change_pct": 0.3, "momentum_5d": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["turnover_rate"] > _chd_p(p, "min_turnover", 5.0) / 100.0,
+                  _chd_p(p, "use_turnover_filter", True)),
+         _chd_opt(ind["change_pct"] > _chd_p(p, "min_change", 3.0) / 100.0,
+                  _chd_p(p, "use_change_filter", True)))},
+    {"id": "limit_up_momentum", "name": "连板接力",
+     "scoring": {"consecutive_limit_ups": 0.4, "change_pct": 0.3,
+                 "amount": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["change_pct"] > _chd_p(p, "min_change", 5.0) / 100.0,
+                  _chd_p(p, "use_change_filter", True)),
+         _chd_opt(ind["consecutive_limit_ups"] >= _chd_p(p, "min_boards", 1),
+                  _chd_p(p, "use_boards_filter", True)))},
+    {"id": "low_volatility_leader", "name": "低波动龙头",
+     "scoring": {"momentum_60d": 0.4, "momentum_20d": 0.3,
+                 "turnover_rate": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["momentum_20d"] > 0,
+                  _chd_p(p, "require_positive_momentum", True)),
+         _chd_opt(ind["annual_vol_20d"] < _chd_p(p, "vol_max", 0.30),
+                  _chd_p(p, "use_volatility_filter", True)),
+         _chd_opt(ind["close"] > ind["ma20"],
+                  _chd_p(p, "require_above_ma20", True)))},
+    {"id": "ma_golden_cross", "name": "MA 金叉",
+     "scoring": {"momentum_20d": 0.5, "vol_ratio_5d": 0.3,
+                 "change_pct": 0.2},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(_chd_sig(ind, "signal_ma_golden_5_20"),
+                  _chd_p(p, "require_ma_golden", True)),
+         _chd_opt(ind["vol_ratio_5d"] >= _chd_p(p, "vol_ratio_min", 1.2),
+                  _chd_p(p, "use_volume_filter", True)),
+         _chd_opt(ind["close"] > ind["ma60"],
+                  _chd_p(p, "require_above_ma60", True)))},
+    {"id": "macd_golden", "name": "MACD 金叉放量",
+     "scoring": {"momentum_60d": 0.4, "vol_ratio_5d": 0.3,
+                 "change_pct": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(_chd_sig(ind, "signal_macd_golden"),
+                  _chd_p(p, "require_macd_golden", True)),
+         _chd_opt(ind["vol_ratio_5d"] >= _chd_p(p, "vol_ratio_min", 1.5),
+                  _chd_p(p, "use_volume_filter", True)))},
+    {"id": "n_day_low_reversal", "name": "新低反转",
+     "scoring": {"change_pct": 0.4, "vol_ratio_5d": 0.3, "momentum_5d": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(_chd_sig(ind, "signal_n_day_low"),
+                  _chd_p(p, "require_n_day_low", True)),
+         _chd_opt(ind["close"] > ind["open"],
+                  _chd_p(p, "require_bullish_candle", True)),
+         _chd_opt(ind["vol_ratio_5d"] >= _chd_p(p, "vol_ratio_min", 1.5),
+                  _chd_p(p, "use_volume_filter", True)))},
+    {"id": "near_limit_up", "name": "逼近涨停",
+     "scoring": {"change_pct": 0.5, "amount": 0.3, "momentum_5d": 0.2},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["change_pct"] > _chd_p(p, "min_change", 7.0) / 100.0,
+                  _chd_p(p, "use_change_filter", True)),
+         _chd_opt(ind["change_pct"] < ind["limit_pct"]
+                  - _chd_p(p, "limit_gap", 3.0) / 100.0,
+                  _chd_p(p, "use_limit_gap_filter", True)))},
+    {"id": "oversold_bounce", "name": "超跌反弹",
+     "scoring": {"change_pct": 0.3, "vol_ratio_5d": 0.3,
+                 "momentum_5d": 0.2, "rsi_14": 0.2},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["rsi_14"] < _chd_p(p, "rsi_max", 30.0),
+                  _chd_p(p, "use_rsi_filter", True)),
+         _chd_opt(ind["close"] > ind["open"],
+                  _chd_p(p, "require_bullish_candle", True)),
+         _chd_opt(ind["vol_ratio_5d"] >= _chd_p(p, "vol_ratio_min", 1.2),
+                  _chd_p(p, "use_volume_filter", True)))},
+    {"id": "oversold_reversal", "name": "超跌反转",
+     "scoring": {"change_pct": 0.4, "rsi_14": 0.3, "vol_ratio_5d": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["rsi_14"] < _chd_p(p, "rsi_max", 30.0),
+                  _chd_p(p, "use_rsi_filter", True)),
+         _chd_opt(ind["change_pct"] > _chd_p(p, "min_change", 1.0) / 100.0,
+                  _chd_p(p, "use_change_filter", True)),
+         _chd_opt(ind["close"] > ind["ma5"],
+                  _chd_p(p, "require_above_ma5", True)))},
+    {"id": "pullback_ma20_bounce", "name": "均线回踩反弹",
+     "scoring": {"momentum_60d": 0.4, "change_pct": 0.3,
+                 "momentum_20d": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt((ind["close"] >
+                   ind["ma20"] * (1 - _chd_p(p, "ma_proximity", 2.0) / 100.0))
+                  & (ind["close"] <
+                     ind["ma20"] * (1 + _chd_p(p, "ma_proximity", 2.0) / 100.0)),
+                  _chd_p(p, "use_ma20_proximity", True)),
+         _chd_opt((ind["ma5"] > ind["ma20"]) & (ind["ma20"] > ind["ma60"]),
+                  _chd_p(p, "require_ma_alignment", True)),
+         _chd_opt(ind["change_pct"] > 0,
+                  _chd_p(p, "require_positive_change", True)))},
+    {"id": "pullback_to_support", "name": "缩量回踩",
+     "scoring": {"momentum_60d": 0.4, "momentum_20d": 0.3,
+                 "turnover_rate": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt((ind["close"] >
+                   ind["ma20"] * (1 - _chd_p(p, "ma_proximity", 0.02)))
+                  & (ind["close"] <
+                     ind["ma20"] * (1 + _chd_p(p, "ma_proximity", 0.02))),
+                  _chd_p(p, "use_ma20_proximity", True)),
+         _chd_opt(ind["vol_ratio_5d"] < _chd_p(p, "vol_ratio_max", 0.8),
+                  _chd_p(p, "use_volume_filter", True)),
+         _chd_opt(ind["close"] > ind["ma60"],
+                  _chd_p(p, "require_above_ma60", True)),
+         _chd_opt(ind["momentum_20d"] > 0,
+                  _chd_p(p, "require_positive_momentum", True)))},
+    {"id": "strong_open", "name": "强势高开",
+     "scoring": {"change_pct": 0.4, "amplitude": 0.2, "amount": 0.4},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["open"] > ind["prev_close"]
+                  * (1 + _chd_p(p, "min_open_gap", 3.0) / 100.0),
+                  _chd_p(p, "use_open_gap_filter", True)),
+         _chd_opt(ind["close"] > ind["open"],
+                  _chd_p(p, "require_close_above_open", True)),
+         _chd_opt(ind["change_pct"] > _chd_p(p, "min_change", 3.0) / 100.0,
+                  _chd_p(p, "use_change_filter", True)))},
+    {"id": "trend_breakout", "name": "趋势突破",
+     "basic": dict(_CHD_BASIC_TREND),
+     "scoring": {"momentum_60d": 0.4, "vol_ratio_5d": 0.3,
+                 "change_pct": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(ind["close"] > ind["ma60"],
+                  _chd_p(p, "require_above_ma60", True)),
+         _chd_opt(_chd_sig(ind, "signal_n_day_high"),
+                  _chd_p(p, "require_n_day_high", True)),
+         _chd_opt(ind["vol_ratio_5d"] >= _chd_p(p, "vol_ratio_min", 2.0),
+                  _chd_p(p, "use_volume_filter", True)))},
+    {"id": "volume_price_surge", "name": "量价齐升",
+     "scoring": {"vol_ratio_5d": 0.4, "change_pct": 0.3,
+                 "momentum_20d": 0.3},
+     "filter": lambda ind, p: _chd_and(
+         _chd_opt(_chd_sig(ind, "signal_ma20_breakout"),
+                  _chd_p(p, "require_ma20_breakout", True)),
+         _chd_opt(ind["vol_ratio_5d"] >= _chd_p(p, "vol_ratio_min", 2.0),
+                  _chd_p(p, "use_volume_filter", True)),
+         _chd_opt(ind["close"] > ind["open"],
+                  _chd_p(p, "require_bullish_candle", True)))},
+]
+
+# 各策略参数默认值（与 chaodi 默认一致；后续 GUI 调参用）
+CHD_DEFAULTS = {
+    "boll_breakout": {"require_boll_breakout": True, "use_volume_filter": True,
+                      "vol_ratio_min": 1.5},
+    "broken_board_recovery": {"require_limit_up": True,
+                              "use_volume_filter": True, "vol_ratio_min": 1.5,
+                              "use_change_filter": True, "change_pct_min": 0.03},
+    "bullish_alignment": {"require_ma_alignment": True,
+                          "require_positive_momentum": True},
+    "consecutive_limit_ups": {"require_limit_up": True,
+                              "use_boards_filter": True, "min_boards": 2},
+    "high_turnover_surge": {"use_turnover_filter": True, "min_turnover": 5.0,
+                            "use_change_filter": True, "min_change": 3.0},
+    "limit_up_momentum": {"use_change_filter": True, "min_change": 5.0,
+                          "use_boards_filter": True, "min_boards": 1},
+    "low_volatility_leader": {"require_positive_momentum": True,
+                              "use_volatility_filter": True, "vol_max": 0.30,
+                              "require_above_ma20": True},
+    "ma_golden_cross": {"require_ma_golden": True, "use_volume_filter": True,
+                        "vol_ratio_min": 1.2, "require_above_ma60": True},
+    "macd_golden": {"require_macd_golden": True, "use_volume_filter": True,
+                    "vol_ratio_min": 1.5},
+    "n_day_low_reversal": {"require_n_day_low": True,
+                           "require_bullish_candle": True,
+                           "use_volume_filter": True, "vol_ratio_min": 1.5},
+    "near_limit_up": {"use_change_filter": True, "min_change": 7.0,
+                      "use_limit_gap_filter": True, "limit_gap": 3.0},
+    "oversold_bounce": {"use_rsi_filter": True, "rsi_max": 30.0,
+                        "require_bullish_candle": True,
+                        "use_volume_filter": True, "vol_ratio_min": 1.2},
+    "oversold_reversal": {"use_rsi_filter": True, "rsi_max": 30.0,
+                          "use_change_filter": True, "min_change": 1.0,
+                          "require_above_ma5": True},
+    "pullback_ma20_bounce": {"use_ma20_proximity": True, "ma_proximity": 2.0,
+                             "require_ma_alignment": True,
+                             "require_positive_change": True},
+    "pullback_to_support": {"use_ma20_proximity": True, "ma_proximity": 0.02,
+                            "use_volume_filter": True, "vol_ratio_max": 0.8,
+                            "require_above_ma60": True,
+                            "require_positive_momentum": True},
+    "strong_open": {"use_open_gap_filter": True, "min_open_gap": 3.0,
+                    "require_close_above_open": True, "use_change_filter": True,
+                    "min_change": 3.0},
+    "trend_breakout": {"require_above_ma60": True, "require_n_day_high": True,
+                       "use_volume_filter": True, "vol_ratio_min": 2.0},
+    "volume_price_surge": {"require_ma20_breakout": True,
+                           "use_volume_filter": True, "vol_ratio_min": 2.0,
+                           "require_bullish_candle": True},
+}
+
+
+def _chd_basic_ok(name, close, mktcap, amt, basic, listing, scan_date):
+    """与 chaodi universe.apply_basic 同序同口径（NaN 比较放行）。"""
+    from datetime import date
+    if basic.get("exclude_st", True) and "ST" in name.upper():
+        return False
+    if "退" in name or "PT" in name.upper():
+        return False
+    if not np.isfinite(close) or close <= 0:
+        return False
+    pmin = basic.get("price_min")
+    if pmin is not None and close < pmin:
+        return False
+    pmax = basic.get("price_max")
+    if pmax is not None and close > pmax:
+        return False
+    cmin = basic.get("market_cap_min")
+    if cmin is not None and (mktcap <= 0 or mktcap < cmin):
+        return False
+    amin = basic.get("amount_min")
+    if amin is not None and amt < amin:
+        return False
+    amax = basic.get("amount_max")
+    if amax is not None and amt > amax:
+        return False
+    nd = basic.get("exclude_new_days")
+    if nd and listing and scan_date:
+        try:
+            y, m, d = (int(x) for x in listing.split("-"))
+            y2, m2, d2 = (int(x) for x in scan_date.split("-"))
+            if (date(y2, m2, d2) - date(y, m, d)).days < nd:
+                return False
+        except Exception:
+            pass
+    return True
+
+
+def _chd_eval_one(code, seq, meta, shares, k, params_by_sid,
+                  min_bars=CHD_MIN_BARS, limit_bars=CHD_LIMIT_BARS,
+                  scan_date=None):
+    """单只股票：指标/信号/逐策略基础过滤/18 策略过滤（只看最后一根）。
+    返回 {sid: fields}；全部未通过时返回 {}。"""
+    n = len(seq)
+    if n < min_bars:
+        return None
+    dates = [r[0] for r in seq]
+    o = np.array([r[1] or np.nan for r in seq], dtype=np.float64)
+    h = np.array([r[2] or np.nan for r in seq], dtype=np.float64)
+    low = np.array([r[3] or np.nan for r in seq], dtype=np.float64)
+    c = np.array([r[4] or np.nan for r in seq], dtype=np.float64)
+    v = np.array([r[5] or 0.0 for r in seq], dtype=np.float64)
+    if k and k > 0:
+        o, h, low, c = o * k, h * k, low * k, c * k
+    code6 = code[2:] if code[:2] in ("sh", "sz", "bj") else code
+    if code6.startswith(("688", "689")):
+        v = v / 100.0
+    name, industry, mktcap = meta.get(code, ("", "", 0.0))
+    ind = _chd_indicators({"open": o, "high": h, "low": low,
+                           "close": c, "volume": v})
+    _chd_signals(ind, code, name)
+    sh = shares.get(code) or 0.0
+    if sh > 0:
+        ind["turnover_rate"] = v * 100.0 / sh * 100.0
+    elif mktcap > 0:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ind["turnover_rate"] = ind["amount"] / mktcap * 100.0
+    close = float(c[-1])
+    amt = float(ind["amount"][-1])
+    listing = dates[0] if n < limit_bars else ""
+    last = _chd_last_map(ind)
+    hits = {}
+    for spec in CHD_STRATEGIES:
+        basic = spec.get("basic") or CHD_BASIC
+        if not _chd_basic_ok(name, close, mktcap, amt, basic,
+                             listing, scan_date):
+            continue
+        p = params_by_sid[spec["id"]]
+        try:
+            mask = spec["filter"](last, p)
+        except Exception:
+            continue
+        if not bool(mask):
+            continue
+        fields = {"code": code, "name": name, "industry": industry,
+                  "mktcap": mktcap, "close": close,
+                  "chg": float(last["change_pct"]) * 100.0
+                  if np.isfinite(last["change_pct"]) else 0.0}
+        for f in spec["scoring"]:
+            val = last.get(f)
+            try:
+                fields[f] = float(val)
+            except (TypeError, ValueError):
+                fields[f] = None
+        hits[spec["id"]] = fields
+    return hits
+
+
+def _chd_universe_ok(code, universe):
+    if universe == "main":
+        return code.startswith(("sh60", "sz00"))
+    if universe == "etf":
+        return _is_etf(code)
+    if universe == "all_etf":
+        return True
+    return not _is_etf(code)
+
+
+def chd_comprehensive_picks(progress=None, top_n=30, universe="all",
+                            apply_perms=True, min_bars=CHD_MIN_BARS,
+                            limit_bars=CHD_LIMIT_BARS, time_budget=300):
+    """全市场 18 策略共振综合荐股（纯本地缓存，不联网）。
+
+    返回 {signal_date, universe, scanned, eligible, pool, truncated,
+          by_strategy, picks, elapsed}；picks 按综合分降序：
+    综合分 = hit_n×100 + mean_score（命中策略数优先，命中策略均分破同）。
+    """
+    if np is None:
+        raise RuntimeError("18 策略综合需要 numpy（pip install numpy）")
+    from datetime import date
+    t0 = time.time()
+    with db_conn() as conn:
+        meta = {c: (nm or "", ind or "", float(cap or 0.0))
+                for c, nm, ind, cap in conn.execute(
+                    "SELECT code,name,industry,mktcap FROM stocks")}
+        try:
+            shares = {c: float(s) for c, s in conn.execute(
+                "SELECT code,shares FROM et_shares") if s}
+        except sqlite3.OperationalError:
+            shares = {}
+        adj = {c: k for c, k in conn.execute(
+            "SELECT code,k FROM adjust WHERE k>0")}
+        try:
+            delisted = {r[0] for r in conn.execute("SELECT code FROM delisted")}
+        except sqlite3.OperationalError:
+            delisted = set()
+        last_by_code = {c: (nb, last) for c, nb, last in conn.execute(
+            "SELECT code, COUNT(*), MAX(date) FROM daily_bars "
+            "GROUP BY code HAVING COUNT(*)>=?", (min_bars,))}
+    if not last_by_code:
+        raise RuntimeError("缓存为空：请先更新行情")
+    cnt = {}
+    for _c, (_nb, last) in last_by_code.items():
+        cnt[last] = cnt.get(last, 0) + 1
+    mkt_date = max(cnt.items(), key=lambda kv: kv[1])[0]
+    codes = []
+    for c, (nb, last) in last_by_code.items():
+        if c.startswith(_CHD_INDEX_PREFIX) or c in delisted:
+            continue
+        if c.startswith("bj"):          # 北交所：与样本池/研究口径一致不入池
+            continue
+        if not _chd_universe_ok(c, universe):
+            continue
+        if apply_perms and not pick_allowed(c, meta.get(c, ("", "", 0.0))[1]):
+            continue
+        try:
+            y, m, d = (int(x) for x in last.split("-"))
+            y2, m2, d2 = (int(x) for x in mkt_date.split("-"))
+            if (date(y2, m2, d2) - date(y, m, d)).days > 3:
+                continue                # 停牌/退市边缘：最后K线过旧
+        except Exception:
+            pass
+        codes.append(c)
+    codes.sort()
+    params_by_sid = {s["id"]: dict(CHD_DEFAULTS[s["id"]])
+                     for s in CHD_STRATEGIES}
+    cands = {s["id"]: [] for s in CHD_STRATEGIES}
+    scanned = 0
+    truncated = False
+    ch = 400
+    for i in range(0, len(codes), ch):
+        chunk = codes[i:i + ch]
+        with db_conn() as conn:
+            ph = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                "SELECT code,date,open,high,low,close,vol FROM ("
+                "  SELECT code,date,open,high,low,close,vol,"
+                "         ROW_NUMBER() OVER (PARTITION BY code "
+                "                            ORDER BY date DESC) rn"
+                "  FROM daily_bars WHERE code IN (%s)"
+                ") WHERE rn<=? ORDER BY code, date" % ph,
+                chunk + [limit_bars]).fetchall()
+        by = {}
+        for c, d, o, h, l, cl, v in rows:
+            by.setdefault(c, []).append((d, o, h, l, cl, v))
+        for c, seq in by.items():
+            hits = _chd_eval_one(c, seq, meta, shares,
+                                 adj.get(c) or 1.0, params_by_sid,
+                                 min_bars, limit_bars, mkt_date)
+            scanned += 1
+            if not hits:
+                continue
+            for sid, fields in hits.items():
+                cands[sid].append(fields)
+        if progress:
+            progress("综合扫描 %d/%d，命中池 %d 只（%.0fs）" % (
+                min(i + ch, len(codes)), len(codes),
+                len({r["code"] for rs in cands.values() for r in rs}),
+                time.time() - t0))
+        if time.time() - t0 > time_budget:
+            truncated = True
+            break
+    # 各策略候选池内 min-max 归一化打分（score = 100 × Σ w×norm）
+    for spec in CHD_STRATEGIES:
+        rows_s = cands[spec["id"]]
+        for f, w in spec["scoring"].items():
+            vals = np.array([r.get(f) if r.get(f) is not None else np.nan
+                             for r in rows_s], dtype=np.float64)
+            finite = np.isfinite(vals)
+            if finite.sum() == 0:
+                continue
+            mn, mx = vals[finite].min(), vals[finite].max()
+            norm = np.zeros(len(rows_s))
+            if mx > mn:
+                norm[finite] = (vals[finite] - mn) / (mx - mn)
+            else:
+                norm[finite] = 0.5      # 单候选：与 chaodi 服务端口径一致
+            for r, nv in zip(rows_s, norm):
+                r["score"] = (r.get("score") or 0.0) + w * float(nv)
+        for r in rows_s:
+            r["score"] = round(float(r.get("score") or 0.0) * 100.0, 4)
+    merged = {}
+    for spec in CHD_STRATEGIES:
+        for r in cands[spec["id"]]:
+            m = merged.setdefault(r["code"], {
+                "code": r["code"], "name": r["name"],
+                "industry": r["industry"], "close": r["close"],
+                "chg": r["chg"], "hits": []})
+            m["hits"].append({"sid": spec["id"], "name": spec["name"],
+                              "score": r["score"]})
+    picks = list(merged.values())
+    for m in picks:
+        m["hits"].sort(key=lambda x: -x["score"])
+        m["hit_n"] = len(m["hits"])
+        m["mean_score"] = sum(h["score"] for h in m["hits"]) / m["hit_n"]
+        m["score"] = m["hit_n"] * 100.0 + m["mean_score"]
+        m["hit_names"] = [h["name"] for h in m["hits"]]
+    picks.sort(key=lambda m: (-m["score"], -m["mean_score"], m["code"]))
+    return {"signal_date": mkt_date, "universe": universe,
+            "scanned": scanned, "eligible": len(codes),
+            "pool": len(merged), "truncated": truncated,
+            "by_strategy": {s["id"]: {"name": s["name"],
+                                      "n": len(cands[s["id"]])}
+                            for s in CHD_STRATEGIES},
+            "picks": picks[:top_n], "elapsed": time.time() - t0}
 
 
 def chip_snapshots(rows, nbin=80, tail=120):
@@ -4137,7 +4969,10 @@ def logret(seq, is_etf=False):
     return rets
 
 
-W_WINDOW, TOPK = 10, 10
+# v6.1.5 热修⑦：原为 `W_WINDOW, TOPK = 10, 10`，会在导入时覆盖
+# _load_predict_cfg() 读入的 ini 值 → 设置界面显示 W=20 实际跑 W=10，
+# 且「保存并应用」只在当次进程生效、重启又回 10。现改为与 CFG 同步。
+W_WINDOW, TOPK = CFG.W_WINDOW, CFG.TOPK
 
 # ---- 三级样本池：L1自身 / L2同行业 / L3同市值层，融合权重 ----
 LV_W = dict(CFG.LV_W)
@@ -4309,9 +5144,11 @@ def _dynamic_lv_weights(levels):
 
 
 def _pool_match(pool_rows, cur, vr_now, idx_chg_by_date, idx_chg_today,
-                topk=TOPK, candidate_topk=None, cur_ctx=None):
-    """多股票池历史窗口匹配；只用样本T及以前的信息，目标收益绝不参与筛选。"""
+                topk=None, candidate_topk=None, cur_ctx=None):
+    """多股票池历史窗口匹配；只用样本T及以前的信息，目标收益绝不参与筛选。
+    topk 缺省在调用时读全局 TOPK（定义期默认值会在「保存并应用」后过期）。"""
     W = W_WINDOW
+    topk = topk or TOPK
     candidate_topk = candidate_topk or CFG.CANDIDATE_TOPK
     info, sims = {}, []
     for code, rows in pool_rows:
@@ -4389,7 +5226,8 @@ def _pool_match(pool_rows, cur, vr_now, idx_chg_by_date, idx_chg_today,
             else:
                 for suf in ("date","cl","hi","lo","oc","oh","ol"): s[f"n{d}_{suf}"]=None
         out.append(s)
-    selected=[]; per_code={}; min_gap=max(3,W//2)
+    # v6.1.5 热修⑦：同股样本窗口间隔取 W（互不重叠；原 W//2 重叠一半）
+    selected=[]; per_code={}; min_gap=max(3,W)
     for s in sorted(out,key=lambda x:x["similarity_score"]):
         c=s["code"]; i=s["_match_i"]
         if any(abs(i-j)<min_gap for j in per_code.get(c,[])): continue
@@ -5273,6 +6111,25 @@ def pick_ablation_consistent(cands, objective="稳健", min_trades=8,
     return dict(pool[i]), "近窗不一致→无多维候选，按全窗"
 
 
+def _pick_one_from_pool(pool, key):
+    """从候选池按某档目标选优（GUI run_ablation 与研究导出共用，口径一致）。
+
+    key: 保守/稳健/激进；保守档限定「保守/稳健参数」候选，其余目标：
+    保守/稳健=偏 Calmar+PF，激进=偏年化+Calmar（见 _ablation_weights）。
+    返回 (picked, note)。"""
+    p = pool
+    if key == "保守":
+        p2 = [c for c in p if c.get("mode") in ("保守", "稳健")]
+        if p2:
+            p = p2
+    obj = "激进" if key in ("均衡", "激进") else "稳健"
+    picked, note = pick_ablation_consistent(
+        p, obj, min_trades=0, recent_of=lambda c: c.get("recent"))
+    if not picked:
+        return dict(p[0]), "回退池内首个"
+    return picked, note
+
+
 def _ablation_pf(trades):
     """由逐笔收益算盈亏比。"""
     gp = sum(x for x in trades if x > 0)
@@ -5375,14 +6232,45 @@ def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None, trade_out=None,
             if peak > 0:
                 mdd = min(mdd, v / peak - 1)
     ann = total ** (1 / years) - 1 if total > 0 else -1.0
-    return {"trades": len(trades), "wins": wins,
-            "winrate": wins / len(trades),
+    # v6.1.6：补齐「信号胜率」面板/导出所需字段，与 _bt_simulate 同义
+    # （trades 只计已平仓；浮动仓单独给 floating；面板与消融逐项一致）。
+    closed = len(trades)
+    losses = closed - wins
+    floating = (c_a[i1 - 1] / entry - 1.0) if entry else None
+    _wins = [t for t in trades if t > 0]
+    _loss = [t for t in trades if t <= 0]
+    avg_win = (sum(_wins) / len(_wins)) if _wins else 0.0
+    avg_loss = (sum(_loss) / len(_loss)) if _loss else 0.0
+    return {"trades": closed, "closed": closed, "wins": wins,
+            "losses": losses,
+            "winrate": wins / closed if closed else None,
             "total": total - 1, "ann": ann, "mdd": mdd,
+            "floating": floating,
+            "avg_win": avg_win, "avg_loss": avg_loss,
+            "profit_loss": (avg_win / abs(avg_loss) if avg_loss
+                            else float("inf")),
+            "trades_list": trades,
             "curve": curve, "i0": i0}
 
 
-RECENT_ABL_BARS = 250       # 选型一致性用的近端子窗长度（截至最新，含验证段）
+RECENT_ABL_BARS = 250       # 选型一致性子窗长度（取训练段末尾，不碰验证段）
 ABL_BARS = 1000             # 消融/工具面板回测窗口（与 run_ablation 一致）
+
+
+def _bt_segments(rows, signals, rp):
+    """全期/训练/验证三段回测（v6.1.6）：与 `run_ablation` 同引擎（`_bt_events`）
+    同切分（val=max(200, n/4)、预计算 ATR），供 GUI 面板与每只股导出复用，
+    保证与「策略消融」弹窗的交易/胜率/年化/回撤逐项一致。
+    返回 (full, train, val, split)；full 可能为 None（平仓交易 <2）。"""
+    nb = len(rows)
+    split = nb - max(200, nb // 4)
+    atrs = _precompute_atr(rows, 0, nb)
+    full = _bt_events(rows, signals, rp, 0, nb, atrs=atrs)
+    tr = (_bt_events(rows, signals, rp, 0, split, atrs=atrs)
+          if split >= 30 else None)
+    va = (_bt_events(rows, signals, rp, split, nb, atrs=atrs)
+          if nb - split >= 30 else None)
+    return full, tr, va, split
 
 
 def _ablation_recent(rows, sigs, rp, n, atrs, arrays=None):
@@ -5606,7 +6494,10 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
             train["pf"] = _ablation_pf(tr_tr)
         if va_tr and val is not None:
             val["pf"] = _ablation_pf(va_tr)
-        rc = _ablation_recent(rows, sigs, rp, n, atrs)
+        # 近端一致性门槛只用「训练段末尾」(split 前) 的数据：
+        # 此前用 rows[0:n] 的最近 250 根，而 n=1000 时那正是验证段 →
+        # 验证集参与了选型门槛（top25% 否决），验证段指标偏乐观（过拟合）。
+        rc = _ablation_recent(rows, sigs, rp, split, atrs)
         return {"algo": algo, "mode": mode, "params": dict(rp),
                 "label": label, "train": train, "val": val,
                 "recent": rc, "bull": bull, "bear": bear}
@@ -5638,19 +6529,9 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
                         key, CFG.RISK_PARAMS["稳健"])),
                     "label": f"多维评分·{key}（样本不足，固定回退）",
                     "train": {}, "val": {}}
-        if key == "保守":
-            # 优化（组合回测 OOS 验证）：在「保守/稳健」风险参数候选中选优
-            pool2 = [c for c in pool if c.get("mode") in ("保守", "稳健")]
-            if pool2:
-                pool = pool2
         # v6.1：多指标结合（Calmar/PF/胜率/年化 rank 加权，仅训练集）；
-        # v6.1.5 热修②：+近端子窗一致性，不一致回退该档「多维评分」
-        obj = "激进" if key in ("均衡", "激进") else "稳健"
-        picked, note = pick_ablation_consistent(
-            pool, obj, min_trades=0, recent_of=lambda c: c.get("recent"))
-        if not picked:
-            picked = dict(pool[0])
-            note = "回退池内首个"
+        # v6.1.5 热修②：+近端子窗一致性（训练段末尾），不一致回退该档「多维评分」
+        picked, note = _pick_one_from_pool(pool, key)
         _pick_notes[key] = note
         return picked
 
@@ -6206,7 +7087,10 @@ def analyze(full, progress=None, quick=False):
                 break
         return pl
 
-    for gap in (max(3, W // 2), 3, 1):
+    # v6.1.5 热修⑦：首选 W（样本窗口互不重叠），不足再逐级放宽；
+    # 原来首档就 W//2，选出的样本窗口彼此重叠一半（同一次波动被重复计入，
+    # 融合权重被同一行情灌水）。
+    for gap in (W, max(3, W // 2), 3, 1):
         picked = _pick(gap)
         if len(picked) >= min(TOPK, 6):
             break
@@ -6471,7 +7355,11 @@ def analyze(full, progress=None, quick=False):
     cur_px = q["price"] if q and q.get("price") else disp_rows[-1]["close"]
     chips = None
     try:
-        chips = calc_chips(disp_rows, cur_px)
+        # 真实换手（总股本取自 stocks.mktcap / 现价；缺失时 calc_chips 退回启发式）
+        _mk = (get_stock_info(full) or {}).get("mktcap") or 0
+        _shares = (_mk / cur_px) if (_mk > 0 and cur_px and cur_px > 0) \
+            else None
+        chips = calc_chips(disp_rows, cur_px, shares=_shares)
     except Exception:
         pass
 
@@ -8376,6 +9264,13 @@ _TIER_PREFIXES = ("sh60", "sh68", "sz00", "sz30",
 _TIER_MIN_PRICE = 1.0
 _TIER_MIN_BARS = 250
 _TIER_MIN_AMOUNT = 3e5            # V(手)×价 = 成交额/100，3e5 → 3000万元
+# ⚠ 口径说明（v6.1.5 审查 P0-2，未引入新数据无法消除，特此备案）：
+# 上面的绝对价/流动性门槛作用在「以今天为锚的乘法前复权价」上（tier_load_panel
+# 用 adjust.k 缩放 hfq）。k 由最新日 raw/hfq 配对算出，含 t 之后的分红/送转信息，
+# 因此历史交易日的绝对价与成交额门槛带**当前锚**：同一回测在不同日期重跑，
+# k 变化会轻微改变历史可交易池（不可完全复现）。收益率类指标（ret20/vol20/
+# beta/闸门）是比值，受 k 影响可约掉；受损面仅限可交易池/绝对阈值。
+# 彻底修复需库内保存**历史复权因子**（point-in-time），届时门槛改用当日 raw 价。
 _TIER_STALE_DAYS = 20
 _TIER_SLIP = 0.001
 _TIER_COMMISSION = 0.00025
