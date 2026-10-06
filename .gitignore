@@ -17,4 +17,5 @@ memory/inbox/
 # CLI 缓存/日志（不入库；stock_predict.py 源码入库，随仓库分发）
 scripts/cli/stock_cache.db*
 scripts/cli/stock_gui.log
+scripts/cli/stock_fetch.log*
 .pytest_cache/

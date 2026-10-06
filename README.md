@@ -10,10 +10,21 @@ stock-analyzer 通过 `--push` 推送的分析报告。
 独立 `RiskManager` 预交易风控拦截层、订单生命周期日志（REQUESTED →
 VALIDATED → FILLED / REJECTED / NO_CHANGE）。
 
+2026-10 重构另参考 MIT 项目 [QUANTAXIS](https://github.com/yutiansut/QUANTAXIS)
+（QASU/QAData/QIFI/QAStrategy/QAFactor 分层）与 [zvt](https://github.com/zvtvz/zvt)
+（TradableEntity/Event + record/query + Factor/Trader），仅借鉴思想、无源码复制，
+归因见 `THIRD_PARTY_NOTICES.md`，说明见 `docs/REFACTOR_qa_zvt.md`。
+
 ## 目录
 
 | 路径 | 用途 |
 |---|---|
+| `core/` | 统一类型与策略基类（`types.Bar/Signal` + `strategy.BaseStrategy/registry`，对标 QAStrategy/zvt-Trader） |
+| `data/store.py` | 统一行情存储（单例+WAL+批量读+索引，对标 QAData/zvt-query；旧 `data/stock/cli_bridge.py` 仍兼容） |
+| `factors/` | 统一因子层：`technical` numpy 12列 / `chaodi` 18策略适配 / `morphology` 形态三档适配 / `ml` LGBM懒加载 |
+| `strategies/` | 统一策略注册表：`chaodi_trend` / `morphology_tier` / `lgbm_prob` / `mix_ensemble`（回测实盘同口径） |
+| `backtest/engine_v2.py` | 策略可插拔回测（沿用 `stock_engine` 成交/费用/ATR止损口径，只换信号源） |
+| `vendors/` | 桌面算法同步拷贝：`chaodi/et_engine` / `sniper/{indicators,features,signals}` / `sm701/lgbm_model.txt+README` |
 | `main.py` | 入口：读取 `config/system.yaml` |
 | `agent/` | 决策链路（stock_decision 股票组合 / ensemble 基金多模型） |
 | `models/` | 模型客户端（deepseek / embedding / prompt / stock_prompt） |
