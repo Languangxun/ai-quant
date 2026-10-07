@@ -1,0 +1,26 @@
+# 美股核心池（Pi 增量同步用，全历史随 global_daily.db 快照走）
+# 入选：指数成分 +  mega caps，覆盖日常观察与回测够用即可
+us_majors:
+  - AAPL
+  - MSFT
+  - NVDA
+  - AMZN
+  - GOOGL
+  - META
+  - AVGO
+  - TSLA
+  - JPM
+  - WMT
+  - NFLX
+  - ORCL
+  - XOM
+  - COST
+  - AMD
+  - PLTR
+  - COIN
+  - MSTR
+  - TSM
+  - BABA
+  - PDD
+  - JD
+  - NIO
