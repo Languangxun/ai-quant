@@ -4,7 +4,7 @@
 
 源：/home/lan/桌面/stock_predict/stock_predict.py
     （stock_gui.py 的唯一生成物 CLI，build_cli.py 每次生成后自动同步）
-目标：orangepi@192.168.3.28:~/ai-quant/scripts/cli/stock_predict.py
+目标：orangepi@192.168.3.34:~/ai-quant/scripts/cli/stock_predict.py
 
 行为：轮询源文件 sha256，发现变化并稳定后：
   1. 本地编译校验（Python 3.14）
@@ -37,7 +37,7 @@ from logging.handlers import RotatingFileHandler
 
 APP = "sync_predict_to_pi"
 DEFAULT_SRC = "/home/lan/桌面/stock_predict/stock_predict.py"
-DEFAULT_HOST = "orangepi@192.168.3.28"
+DEFAULT_HOST = "orangepi@192.168.3.34"
 DEFAULT_DEST = "~/ai-quant/scripts/cli"
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", APP)
 DEFAULT_LOG = os.path.join(CACHE_DIR, "sync.log")
