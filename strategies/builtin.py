@@ -192,8 +192,8 @@ class Sm701Universal(BaseStrategy):
     def generate(self, bars_by_code, ctx=None):
         from factors import ml as _ml
         from factors import sm701 as _s
-        if not _ml.available() or not _ml.model_path():
-            return []
+        if not _ml.available():
+            return []   # 无 lightgbm; 单/production 模型各自在 predict 内探测
         ctx = ctx or {}
         # 阈值: ctx.threshold 优先, 否则按市场默认 (fund 0.52, 其余 0.55),
         # 也可 ctx.thresholds={market: thr} 批量覆写 (config/markets.yaml 同值).
@@ -214,14 +214,6 @@ class Sm701Universal(BaseStrategy):
         default_thr = float(default_thr) if default_thr is not None else None
         # 市场环境: 同批 codes 的当日 ret 均值/上涨占比 (mkt/breadth),
         # 横截面 rank (r_*) 按当日值分位; 单只/基金无对手时回退 0/0.5.
-        closes_by = {}
-        for code, bars in (bars_by_code or {}).items():
-            if bars and len(bars) >= 2:
-                closes_by[code] = [b.close for b in bars]
-        last_dates = {}
-        for code, bars in (bars_by_code or {}).items():
-            if bars:
-                last_dates[code] = bars[-1].date
         # 按 date 分组算市场均值 (同 date 才可比, 跨市场日历不同天然分组)
         rets = {}
         for code, bars in (bars_by_code or {}).items():

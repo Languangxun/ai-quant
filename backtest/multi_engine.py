@@ -76,7 +76,7 @@ def _trade_dates(market, start="", end=""):
     return out
 
 
-def run(market="hk", limit=200, topk=5, threshold=None, start="", end="",
+def run(market="hk", limit=None, topk=None, threshold=None, start="", end="",
         capital=None, max_hold=None, min_hold=None, progress=print):
     from strategies import builtin as _b  # noqa: 注册表
     from strategies import registry
@@ -96,6 +96,9 @@ def run(market="hk", limit=200, topk=5, threshold=None, start="", end="",
     thr = float(threshold if threshold is not None
                 else (mcfg.get("sm701") or {}).get(
                     "threshold", 0.52 if market == "fund" else 0.55))
+    # limit 未给时读 yaml max_scan (fut 0=全扫), 兜底 200; CLI 默认 None 不再吃掉配置
+    if not limit:
+        limit = int(mcfg.get("max_scan") or 0) or 200
     uni = _universe(market, limit if market != "fund" else 0)
     if not uni:
         raise SystemExit(f"[{market}] 无成分 (缺 global_daily.db / NAV 拉取失败?)")
@@ -265,12 +268,15 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--market", default="hk")
-    ap.add_argument("--limit", type=int, default=200)
-    ap.add_argument("--topk", type=int, default=5)
+    ap.add_argument("--limit", type=int, default=None,
+                    help="缺省读 markets.yaml max_scan (兜底200)")
+    ap.add_argument("--topk", type=int, default=None,
+                    help="缺省读 markets.yaml max_positions")
     ap.add_argument("--threshold", type=float, default=None)
     ap.add_argument("--start", default="")
     ap.add_argument("--end", default="")
-    ap.add_argument("--min-hold", type=int, default=5)
+    ap.add_argument("--min-hold", type=int, default=None,
+                    help="缺省读 markets.yaml min_hold")
     a = ap.parse_args()
     print(run(a.market, a.limit, a.topk, a.threshold, a.start, a.end,
               min_hold=a.min_hold))
