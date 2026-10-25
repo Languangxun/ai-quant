@@ -97,6 +97,37 @@ def row_on(code, date):
             "low": r["low"], "close": r["close"], "vol": r["vol"] or 0.0}
 
 
+def adjust_k(code):
+    """库内后复权价 → 实际价的缩放系数 k (=raw_close/hfq_close)。
+
+    缓存统一存后复权(hfq)价（如 sh600000 收 164.87），而实时行情是实际
+    价（浦发 9.5 左右），两者不同量纲。adjust 表由 CLI 每日 _sync_adjust
+    刷新；缺失记录时按 1.0 处理（ETF/无分红标的本来就是 1）。
+    """
+    try:
+        with db_connect() as con:
+            r = con.execute("SELECT k FROM adjust WHERE code=?",
+                            (code,)).fetchone()
+    except sqlite3.Error:
+        return 1.0
+    return float(r[0]) if r and r[0] else 1.0
+
+
+def display_price(code, hfq_price):
+    """把库内后复权价换算成与实时行情同口径的实际价。"""
+    if not hfq_price:
+        return hfq_price
+    return hfq_price * adjust_k(code)
+
+
+def latest_display_close(code, tail=1):
+    """缓存最新收盘（实际价口径 = hfq_close × k）。无数据返回 None。"""
+    rows = db_rows(code, tail=tail)
+    if not rows:
+        return None
+    return display_price(code, rows[-1]["close"])
+
+
 def prev_close(code, date):
     """date 之前最近一根收盘价（涨跌停校验用）。"""
     with db_connect() as con:
@@ -218,7 +249,9 @@ def universe(min_bars=400, recent_days=15, exclude_etf=True,
             continue
         if boards == "main" and not code.startswith(("sh60", "sz00")):
             continue
-        if close < (etf_min_price if is_etf_code_ else min_price):
+        # 仙股过滤：库内是后复权价，须乘 adjust 系数 k 还原实际价再比阈值
+        real_close = close * adjust_k(code)
+        if real_close < (etf_min_price if is_etf_code_ else min_price):
             continue
         (etfs if etf_like else stocks).append(
             (code, name, industry, mktcap))
@@ -270,7 +303,8 @@ def candidates(top_n=30, max_scan=300, min_bars=400, min_price=2.0,
         picks.append({
             "code": code, "name": name, "industry": industry,
             "kind": "etf" if is_etf(code) else "stock",
-            "close": rows[-1]["close"], "chg": round(chg, 2),
+            "close": display_price(code, rows[-1]["close"]),
+            "chg": round(chg, 2),
             "score": score, "reasons": " ".join(reasons) or "-",
             "band": band, "mktcap": mktcap,
         })

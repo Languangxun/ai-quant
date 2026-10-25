@@ -1,0 +1,61 @@
+# 多市场配置 (基金/港/美/加密; A股仍走 stock.yaml).
+# sm701 为暂代因子 (A股训练, 域外推), 阈值按市场分别设, 回测/实盘同口径.
+markets:
+  fund:  # 场外联接C (FUND_MAP 10只, NAV日频, T+1确认)
+    enabled: true
+    capital: 20000
+    max_positions: 3
+    max_position_pct: 40
+    min_order_amount: 100.0   # 场外100元起购
+    min_order_pct: 1.0
+    min_hold: 1             # 场外零费率, 日切不心疼
+    max_hold: 20
+    fees: {commission_rate: 0.0, min_commission: 0.0, stamp_tax_rate: 0.0, transfer_fee_rate: 0.0}
+    sm701: {threshold: 0.52, min_bars: 65}
+  hk:    # 港股 (hk:00700, T+0, 无涨跌停)
+    enabled: true
+    capital: 20000
+    max_positions: 5
+    max_position_pct: 20
+    min_order_amount: 1000.0
+    min_order_pct: 5.0
+    min_hold: 5             # 有费率需降频
+    max_hold: 20
+    max_scan: 200           # 实盘按成交额/市值取前N (Pi省时)
+    fees: {commission_rate: 0.0003, min_commission: 3.0, stamp_tax_rate: 0.001, transfer_fee_rate: 0.00002}
+    sm701: {threshold: 0.55, min_bars: 65}
+  us:    # 美股 (us:AAPL, T+0, 1股起)
+    enabled: true
+    capital: 20000
+    max_positions: 5
+    max_position_pct: 20
+    min_order_amount: 100.0  # 美元口径换算前, 先按同数值
+    min_order_pct: 5.0
+    min_hold: 5
+    max_hold: 20
+    max_scan: 200
+    fees: {commission_rate: 0.0002, min_commission: 1.0, stamp_tax_rate: 0.0, transfer_fee_rate: 0.0}
+    sm701: {threshold: 0.55, min_bars: 65}
+  crypto:  # 加密 (crypto:BTC/USDT, 7x24, 仅佣金, 小数份额)
+    enabled: true
+    capital: 10000
+    max_positions: 3
+    max_position_pct: 40
+    min_order_amount: 10.0   # USDT
+    min_order_pct: 1.0
+    min_hold: 5
+    max_hold: 20
+    fees: {commission_rate: 0.001, min_commission: 0.0, stamp_tax_rate: 0.0, transfer_fee_rate: 0.0}
+    sm701: {threshold: 0.55, min_bars: 65}
+  fut:   # 国内期货主力连续 (fut:RB0, 82品种, T+0, 仅佣金; 无杠杆简化口径)
+    enabled: true
+    capital: 20000
+    max_positions: 5
+    max_position_pct: 20
+    min_order_amount: 1000.0  # 按点价记账, 单笔>=1000
+    min_order_pct: 5.0
+    min_hold: 2             # T+0 但仍防日切磨损
+    max_hold: 20
+    max_scan: 0             # 82品种全扫
+    fees: {commission_rate: 0.0002, min_commission: 2.0, stamp_tax_rate: 0.0, transfer_fee_rate: 0.0}
+    sm701: {threshold: 0.55, min_bars: 65}

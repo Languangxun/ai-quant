@@ -18,7 +18,7 @@
 ## 桌面算法同步
 
 - `vendors/chaodi/et_engine/` <- ~/桌面/chaodi_strategies/et_engine (18 策略, 本次拷贝)
-- `vendors/sniper/{indicators,features,signals}.py` <- ~/桌面/market-sniper/market_sniper (向量化写法参考)
+- `vendors/sniper/{indicators,features,signals}.py` <- ~/桌面/market-sniper/market_sniper (向量化写法参考; signals 含 boll_atr / lgbm 港 / lgbm_us_short 美)
 - `vendors/sm701/README` <- ~/桌面/sm701 特征表/模型说明 (代码不全拷, 只记 44 维表 + 懒加载, 模型 txt 另拷)
 - `scripts/cli/stock_predict.py` 已在库 (morphology 同源, 由 build_cli.py 生成)
 - 加载优先级: vendors > 桌面绝对路径 > Pi 降级 (空信号, 不抛错)

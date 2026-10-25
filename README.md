@@ -1,9 +1,9 @@
 # ai-quant · OrangePi 量化系统
 
-Pi（`orangepizero2w`）上的 AI 量化研究与模拟交易系统：**股票+ETF 组合模拟盘**
-（CLI 选股 + LLM 决策 + A股账本 + 全缓存回测）、旧版场外 ETF 联接 C 类基金
-模式（etf-c，保留可切换）、每日复盘与 U 盘快照备份，并接收本机
-stock-analyzer 通过 `--push` 推送的分析报告。
+Pi（`orangepizero2w`）上的 AI 量化研究与模拟交易系统：**多市场组合模拟盘**
+（基金/港/美/加密/期货 + 股票/ETF，CLI 选股 + LLM 决策 + 全缓存回测）、
+旧版场外 ETF 联接 C 类基金模式（etf-c，保留可切换）、每日复盘与
+U 盘快照备份，并接收本机 stock-analyzer 通过 `--push` 推送的分析报告。
 
 架构借鉴 [AKQuant](https://github.com/akfamily/akquant) 的三层拆分（轻量 Python 版）：
 `MarketModel`（可插拔交易规则：股票/ETF、T+1/T+0、涨跌停、费用）、
@@ -24,7 +24,7 @@ VALIDATED → FILLED / REJECTED / NO_CHANGE）。
 | `factors/` | 统一因子层：`technical` numpy 12列 / `chaodi` 18策略适配 / `morphology` 形态三档适配 / `ml` LGBM懒加载 |
 | `strategies/` | 统一策略注册表：`chaodi_trend` / `morphology_tier` / `lgbm_prob` / `mix_ensemble`（回测实盘同口径） |
 | `backtest/engine_v2.py` | 策略可插拔回测（沿用 `stock_engine` 成交/费用/ATR止损口径，只换信号源） |
-| `vendors/` | 桌面算法同步拷贝：`chaodi/et_engine` / `sniper/{indicators,features,signals}` / `sm701/lgbm_model.txt+README` |
+| `vendors/` | 桌面算法同步拷贝：`chaodi/et_engine` / `sniper/{indicators,features,signals}` / `sm701/lgbm_model.txt+README`（Pi 另拷 `sm701/production/` 分市场模型，不入库） |
 | `main.py` | 入口：读取 `config/system.yaml` |
 | `agent/` | 决策链路（stock_decision 股票组合 / ensemble 基金多模型） |
 | `models/` | 模型客户端（deepseek / embedding / prompt / stock_prompt） |
@@ -86,6 +86,38 @@ VALIDATED → FILLED / REJECTED / NO_CHANGE）。
 - **订单日志**：指令状态落 `sim/state/order_journal.jsonl`（REQUESTED →
   VALIDATED → FILLED / REJECTED / NO_CHANGE），风控在
   `risk/stock_rules.py` 独立拦截层统一判定。
+- **LLM 自动降级**：DeepSeek 余额不足/额度耗尽/鉴权失败，或网络不可达
+  （网口抖动导致 Connection error）时，自动切纯代码评分轮动
+  （卖出跌出评分前列或 -5% 止损的持仓，买入评分最高候选），
+  继续遵守持仓数/单票上限/日内买入限额；恢复后自动回到 LLM 决策。
+
+## 多市场模拟盘（基金/港/美/加密/期货）
+
+`sim/multi_run.py` + `backtest/multi_engine.py`，无 LLM、Pi 友好，
+**sm701 自动识别市场**：信号层按代码前缀（hk:/us:/fut:/crypto:/fund:）
+分市场选模型——
+
+- **hk/us/fut 默认 sm701**：优先 production 分市场三周期模型
+  （`prod_{hk|us|fut}_h{1,5,10}_tech.txt`，40 维 tech 特征，三周期等权，
+  与桌面 stock_predict v7 实时复算同口径）；模型缺失自动回退 44 维单模型。
+  模型目录：`vendors/sm701/production/`（Pi）或 `~/桌面/sm701/production/`（桌面）。
+- cn/fund/crypto 走 44 维单模型（A股口径保持可比，fund/crypto 为域外推暂代）。
+- 阈值按市场分别配在 `config/markets.yaml`（`sm701.threshold`，默认 fund
+  0.52 / 其余 0.55）。
+
+```bash
+python3 -m sim.multi_run --market fut --dry-run      # 试跑（fut=国内期货82主力连续）
+python3 -m sim.multi_run --market all                # fund+hk+us+crypto+fut
+python3 -m backtest.multi_engine --market fut --min-hold 2
+```
+
+- 数据：港/美/加密/期货日K 在 `data/global_daily.db`（增量
+  `scripts/sync_global_daily.py`，期货自 sm701 副本库同源同步）。
+- 期货口径：T+0、仅佣金、涨跌停/保证金/合约乘数未建模（现金全额记账，
+  高价品种单笔额度不足一手时跳过）；编码 `fut:RB0`，与 sm701 fut_daily
+  主力连续同源。
+- 状态：`sim/state/multi-{market}.json` + `memory/daily/multi-{market}-*.json`，
+  状态页「多市场」区含期货卡片。
 
 ## CLI（预测/选股引擎）
 
@@ -93,7 +125,8 @@ VALIDATED → FILLED / REJECTED / NO_CHANGE）。
 cd scripts/cli && python3 stock_predict.py 000725
 ```
 
-- 源码 `scripts/cli/stock_predict.py` 已入库（生成物但随仓库分发）；
+- 源码 `scripts/cli/stock_predict.py` 已入库（生成物但随仓库分发，
+  2026-10-25 同步桌面 v7.0.1 多市场版）；
   缓存 `scripts/cli/stock_cache.db`（全市场日K，约 1272 万根）不入库，
   新环境用 `--refresh-cache` / `--backfill` / `--refresh-etf` 重建
 - AI：优先 `DEEPSEEK_API_KEY` / `stock_gui.ini [deepseek]`；缺省回退主目录

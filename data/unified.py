@@ -1,14 +1,16 @@
-"""data.unified: 四库合一读取层 (A股 + 港/美/加密日K).
+"""data.unified: 五库合一读取层 (A股 + 港/美/加密/期货日K).
 
 统一编码 (沿用 market-sniper 市场前缀习惯):
   A股: sh600000 / sz000725 (裸码, 与现有 cli_bridge 兼容)
   港股: hk:00700   美股: us:AAPL   加密: crypto:BTC/USDT (sniper 原生)
+  期货: fut:RB0 (国内主力连续 82 品种, sm701 fut_daily 同源编码)
 
 物理库 (ATTACH 联邦, 不搬数据, 单连接跨库查):
   ashare: scripts/cli/stock_cache.db (A股 12.7M 根, 2.2G)
           Pi 上另有 /media/usb/ashare/stock_cache.db 同内容归档
-  global: data/global_daily.db (港/美/加密日线, 8.86M 根, 1.3G,
-          由 scripts/build_global_daily.py 从 market-sniper 快照构建)
+  global: data/global_daily.db (港/美/加密/期货日线, 由
+          scripts/build_global_daily.py 构建快照 + sync_global_daily.py
+          增量维护; 期货自 2026-10 起为 sm701 fut_daily 同源)
           Pi 上路径 /media/usb/ashare/global_daily.db
 
 设计参考 zvt Schema.query_data (统一 query, 市场即参数) 与
@@ -73,7 +75,7 @@ def paths():
 
 def _split(mcode):
     mcode = str(mcode or "").strip()
-    if mcode.startswith(("hk:", "us:", "crypto:")):
+    if mcode.startswith(("hk:", "us:", "crypto:", "fut:")):
         m, c = mcode.split(":", 1)
         return m, c
     return "cn", mcode
@@ -110,8 +112,9 @@ def get_bars(mcode, tail=None):
                 for r in rows]
     if not _has_g():
         return []
-    mm = {"hk": "HK", "us": "US", "crypto": "CRYPTO"}[m]
-    cc = code.upper() if m in ("us",) else code
+    mm = {"hk": "HK", "us": "US", "crypto": "CRYPTO",
+          "fut": "FUT"}[m]
+    cc = code.upper() if m in ("us", "fut") else code
     if m == "crypto":
         cc = code.upper().replace("-", "/")  # 库内为 sniper 原生 BTC/USDT
     sql = ("SELECT date,open,high,low,close,volume FROM g.daily_bars "
@@ -139,11 +142,13 @@ def universe(market="cn"):
                 b.universe(min_bars=100, max_scan=5000)]
     if not _has_g():
         return []
-    mm = {"hk": "HK", "us": "US", "crypto": "CRYPTO"}[market]
+    mm = {"hk": "HK", "us": "US", "crypto": "CRYPTO",
+          "fut": "FUT"}[market]
     rows = connect().execute(
         "SELECT code, name FROM g.stocks WHERE market=? ORDER BY code",
         (mm,)).fetchall()
-    pre = {"hk": "hk:", "us": "us:", "crypto": "crypto:"}[market]
+    pre = {"hk": "hk:", "us": "us:", "crypto": "crypto:",
+           "fut": "fut:"}[market]
     return [(pre + r["code"], r["name"] or "") for r in rows]
 
 
@@ -161,7 +166,8 @@ def trade_dates(market="cn", start=None):
                 con.execute(q + " ORDER BY date", a).fetchall()]
     if not _has_g():
         return []
-    mm = {"hk": "HK", "us": "US", "crypto": "CRYPTO"}[market]
+    mm = {"hk": "HK", "us": "US", "crypto": "CRYPTO",
+          "fut": "FUT"}[market]
     q = "SELECT DISTINCT date FROM g.daily_bars WHERE market=?"
     a = [mm]
     if start:
@@ -181,7 +187,8 @@ def counts():
         out["cn"] = {"codes": r[0], "rows": r[1],
                      "min": r[2], "max": r[3]}
     if _has_g():
-        for m, mm in (("hk", "HK"), ("us", "US"), ("crypto", "CRYPTO")):
+        for m, mm in (("hk", "HK"), ("us", "US"), ("crypto", "CRYPTO"),
+                  ("fut", "FUT")):
             r = con.execute("SELECT COUNT(DISTINCT code), COUNT(*), "
                             "MIN(date), MAX(date) FROM g.daily_bars "
                             "WHERE market=?", (mm,)).fetchone()
