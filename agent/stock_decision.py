@@ -102,7 +102,9 @@ class StockDecisionMaker:
         self.init_error = None
         try:
             self.client = DeepSeekModel(
-                system_prompt=system_prompt or build_system_prompt())
+                system_prompt=system_prompt or build_system_prompt(),
+                daily_context=True,   # 一天一个会话: 前缀缓存命中, 降费提速
+            )
             self.model = self.client.model
         except Exception as e:
             self.init_error = e

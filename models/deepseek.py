@@ -89,8 +89,15 @@ def extract_json(text):
 
 class DeepSeekModel(BaseModel):
 
-    def __init__(self, system_prompt=None):
-
+    def __init__(self, system_prompt=None, daily_context=False,
+                 context_dir=None):
+        """
+        daily_context=True 时启用「一天一个会话」：当日历史多轮持久化在
+        context_dir/llm_daily_YYYY-MM-DD.json，每次请求 messages =
+        [system] + 当日历史 + 新 user 消息。DeepSeek 按前缀缓存计费
+        (命中部分约 1/10 价格)，历史段稳定不变 → 逐时点请求大面积命中；
+        跨天自动开新会话。仅追加成功(可解析)的轮次，失败重试的前缀不变。
+        """
         config = load_model_config()
 
         decision_config = config["models"]["decision"]
@@ -106,6 +113,10 @@ class DeepSeekModel(BaseModel):
         self.temperature = 0.2
 
         self.system_prompt = system_prompt or SYSTEM_PROMPT
+
+        self.daily_context = daily_context
+        _base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.context_dir = context_dir or os.path.join(_base, "sim", "state")
 
         api_key = os.getenv(
             "DEEPSEEK_API_KEY"
@@ -129,9 +140,74 @@ class DeepSeekModel(BaseModel):
 
         )
 
+    # ---------- 日内会话 (前缀缓存优化) ----------
 
+    def _ctx_path(self, day):
+        return os.path.join(self.context_dir, f"llm_daily_{day}.json")
+
+    def _load_history(self):
+        """读当日会话; 跨天/无文件/损坏都返回全新文档 (绝不动旧前缀)."""
+        day = time.strftime("%Y-%m-%d")
+        try:
+            with open(self._ctx_path(day), encoding="utf-8") as f:
+                doc = json.load(f)
+            if doc.get("date") == day and isinstance(doc.get("turns"), list):
+                doc.setdefault("usage", [])
+                return doc
+        except Exception:
+            pass
+        return {"date": day, "turns": [], "usage": []}
+
+    def _save_history(self, doc):
+        os.makedirs(self.context_dir, exist_ok=True)
+        p = self._ctx_path(doc["date"])
+        with open(p + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False)
+        os.replace(p + ".tmp", p)
+        self._gc_history()
+
+    def _gc_history(self, keep_days=7):
+        """顺手清理过期会话文件 (sim/state 不入 git)."""
+        try:
+            import glob
+            cutoff = time.strftime(
+                "%Y-%m-%d", time.gmtime(time.time() - keep_days * 86400))
+            for p in glob.glob(os.path.join(
+                    self.context_dir, "llm_daily_*.json")):
+                d = os.path.basename(p)[len("llm_daily_"):-len(".json")]
+                if d < cutoff:
+                    os.remove(p)
+        except Exception:
+            pass
 
     def _chat(self, context):
+
+        user_msg = json.dumps(
+            context,
+            ensure_ascii=False
+        )
+
+        doc = self._load_history() if self.daily_context else None
+
+        messages = [
+
+            {
+                "role": "system",
+                "content": self.system_prompt
+            }
+
+        ]
+        for t in (doc["turns"] if doc else []):
+            messages.append({"role": "user", "content": t["user"]})
+            messages.append({"role": "assistant", "content": t["assistant"]})
+
+        messages.append({
+
+            "role": "user",
+
+            "content": user_msg
+
+        })
 
         response = self.client.chat.completions.create(
 
@@ -139,28 +215,33 @@ class DeepSeekModel(BaseModel):
 
             temperature=self.temperature,
 
-            messages=[
-
-                {
-                    "role": "system",
-                    "content": self.system_prompt
-                },
-
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        context,
-                        ensure_ascii=False
-                    )
-                }
-
-            ]
+            messages=messages
 
         )
 
         content = response.choices[0].message.content
 
-        return extract_json(content)
+        result = extract_json(content)
+
+        if doc is not None:
+            # 仅在解析成功后追加: 失败重试时前缀与上次完全一致, 仍吃缓存
+            usage = getattr(response, "usage", None)
+            hit = getattr(usage, "prompt_cache_hit_tokens", None)
+            miss = getattr(usage, "prompt_cache_miss_tokens", None)
+            doc["turns"].append({
+                "time": time.strftime("%H:%M"),
+                "user": user_msg, "assistant": content,
+            })
+            doc["usage"].append({
+                "time": time.strftime("%H:%M"),
+                "cache_hit": hit, "cache_miss": miss,
+                "completion": getattr(usage, "completion_tokens", None),
+            })
+            self._save_history(doc)
+            print(f"[llm] 当日第{len(doc['turns'])}轮 前缀缓存命中={hit} "
+                  f"未命中={miss} tokens", flush=True)
+
+        return result
 
 
 

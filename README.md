@@ -138,6 +138,7 @@ cd scripts/cli && python3 stock_predict.py 000725
 | 用途 | 配置 | 说明 |
 |---|---|---|
 | 决策 | `config/model.yaml` → `deepseek-flash` | DeepSeek-V4.1-Flash，`api.deepseek.com`，Key 在 `.env` |
+| 缓存 | 一天一个会话（`sim/state/llm_daily_*.json`） | 当日历史多轮追加，DeepSeek 前缀缓存命中（约 1/10 价），跨天自动新会话 |
 | 记忆 | Ollama `qwen3-embedding:0.6b` | 相似历史检索（RAG），失败自动降级 |
 
 ## 状态页（`/quant/`）
