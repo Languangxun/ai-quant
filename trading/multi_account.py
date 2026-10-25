@@ -62,6 +62,7 @@ class MultiAccount:
         self.transfer_fee_rate = float(transfer_fee_rate)
         self.cash = float(initial_capital)
         self.lots = {}
+        self.last_prices = {}   # {code: 最近一次已知价} 停牌/跌出池时估值兜底
         self.fees = 0.0
         self.realized_pnl = 0.0
         self.trade_count = 0
@@ -101,8 +102,16 @@ class MultiAccount:
     def position_value(self, code, price):
         return self.total_shares(code) * (price or 0.0)
 
+    def price_of(self, code, prices):
+        """持仓估值价: 当日价优先, 缺失(停牌/跌出池)回退最近已知价, 仍缺为 0."""
+        px = float((prices or {}).get(code) or 0.0)
+        if px > 0:
+            self.last_prices[code] = px
+            return px
+        return float(self.last_prices.get(code, 0.0))
+
     def market_value(self, prices):
-        return sum(self.position_value(c, prices.get(c, 0.0))
+        return sum(self.total_shares(c) * self.price_of(c, prices)
                    for c in self.position_codes())
 
     def total_asset(self, prices):
@@ -127,6 +136,7 @@ class MultiAccount:
         self.cash -= amount + fee
         self.fees += fee
         self.trade_count += 1
+        self.last_prices[code] = float(price)
         lot = FloatLot(code=code, shares=shares, cost=(amount + fee) / shares,
                        buy_date=str(trade_date),
                        sellable_date=str(sellable_date),
@@ -166,6 +176,7 @@ class MultiAccount:
         self.lots[code] = keep
         if not keep:
             self.lots.pop(code, None)
+        self.last_prices[code] = float(price)
         self.cash += amount - fee
         self.fees += fee
         self.realized_pnl += realized
@@ -183,6 +194,7 @@ class MultiAccount:
             "stamp_tax_rate": self.stamp_tax_rate,
             "transfer_fee_rate": self.transfer_fee_rate,
             "cash": self.cash, "fees": self.fees,
+            "last_prices": dict(self.last_prices),
             "realized_pnl": self.realized_pnl,
             "trade_count": self.trade_count,
             "lots": {c: [vars(l) for l in ls] for c, ls in self.lots.items()},
@@ -196,6 +208,7 @@ class MultiAccount:
                 s.get("stamp_tax_rate", 5e-4),
                 s.get("transfer_fee_rate", 1e-5))
         a.cash = s.get("cash", a.initial_capital)
+        a.last_prices = dict(s.get("last_prices") or {})
         a.fees = s.get("fees", 0.0)
         a.realized_pnl = s.get("realized_pnl", 0.0)
         a.trade_count = s.get("trade_count", 0)
@@ -207,7 +220,7 @@ class MultiAccount:
         pos = {}
         for code in self.position_codes():
             sh = self.total_shares(code)
-            px = prices.get(code, 0.0)
+            px = self.price_of(code, prices)
             cost = (sum(l.cost * l.shares for l in self.lots[code]) / sh
                     if sh else 0.0)
             pos[code] = {

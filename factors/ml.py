@@ -128,7 +128,6 @@ def predict_proba(feature_rows, market="cn"):
     import numpy as np
     prod = _prod_set(market)
     if prod:
-        import lightgbm as lgb
         feats = prod["feats"]
         X = np.array([[float(r.get(k, 0.0)) for k in feats]
                       for r in feature_rows], dtype=np.float32)

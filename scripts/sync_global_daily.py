@@ -183,7 +183,7 @@ FUT_NAMES = {
     "LR0": "籼稻", "LU0": "低硫燃油", "M0": "豆粕", "MA0": "甲醇",
     "NI0": "沪镍", "NR0": "20号胶", "OI0": "菜油", "OP0": "菜油专",
     "P0": "棕榈油", "PB0": "沪铅", "PD0": "钯金", "PF0": "短纤",
-    "PG0": "LPG", "PK0": "花生", "PL0": "原木专", "PP0": "聚丙烯",
+    "PG0": "LPG", "PK0": "花生", "PL0": "铂金", "PP0": "聚丙烯",
     "PR0": "数据专", "PS0": "数据PS", "PT0": "PTA专", "PX0": "对二甲苯",
     "RB0": "螺纹钢", "RI0": "早籼稻", "RM0": "菜粕", "RR0": "粳米",
     "RS0": "菜籽", "RU0": "橡胶", "SA0": "纯碱", "SC0": "原油",
@@ -287,7 +287,8 @@ def sync_fut(con, workers=4):
                     con.executemany(
                         "INSERT OR IGNORE INTO daily_bars(market, code, date,"
                         " open, high, low, close, volume) "
-                        "VALUES('FUT',?,?,?,?,?,?,?)", rows)
+                        "VALUES('FUT',?,?,?,?,?,?,?)",
+                        [(code,) + r for r in rows])
                     con.commit()
                     n += len(rows)
             except Exception as e:

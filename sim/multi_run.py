@@ -83,6 +83,9 @@ def run_one(market, top=5, limit=200, dry_run=False, threshold=None):
                 else (mcfg.get("sm701") or {}).get(
                     "threshold", 0.52 if market == "fund" else 0.55))
     min_bars = int((mcfg.get("sm701") or {}).get("min_bars", 65))
+    # limit 未给时读 yaml max_scan (fut 0=全扫), 兜底 200
+    if not limit:
+        limit = int(mcfg.get("max_scan") or 0) or 200
     uni = _universe(market, limit)
     print(f"[{market}] 候选 {len(uni)} 只 thr={thr} top={max_pos}")
     bars_map, names = {}, {}
@@ -199,7 +202,8 @@ def main(argv=None):
     ap.add_argument("--market", default="all",
                     help="fund/hk/us/crypto/fut/all")
     ap.add_argument("--top", type=int, default=0)
-    ap.add_argument("--limit", type=int, default=200)
+    ap.add_argument("--limit", type=int, default=0,
+                    help="缺省读 markets.yaml max_scan (兜底200)")
     ap.add_argument("--threshold", type=float, default=None)
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
