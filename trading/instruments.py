@@ -7,6 +7,17 @@
   主板 ST 5%）；卖出印花税 + 过户费。
 - ETF/LOF：默认 T+1，跨境/债券/黄金/货币/商品类为 T+0；
   免印花税与过户费；创业板/科创板相关 ETF 涨跌停 20%，其余 10%。
+- fund（场外联接C，如 fund:007301）：T+1 确认（申赎 next-day），
+  无涨跌停 (limit=1.0 跳过校验)，免印花/过户，按金额申购份额可小数。
+- hk（hk:00700）：T+0，无涨跌停，印花税+过户费按账户默认，lot=1
+  （简化；港股实际一手股数不定）。
+- us（us:AAPL）：T+0，无涨跌停，免印花/过户，lot=1（美股1股起）。
+- crypto（crypto:BTC/USDT）：T+0 7x24，无涨跌停，仅佣金，lot=0
+  （小数份额，风控整手校验跳过）。
+- fut（fut:RB0）：国内期货主力连续，T+0（当日开仓可平），仅佣金，
+  lot=1（按手整数）。**简化口径**：各品种涨跌停幅度/保证金/合约乘数
+  未逐一建模，涨跌停校验跳过（limit_pct=1.0），按现金全额记账（无杠杆）；
+  与 sm701 fut_daily 主力连续同源编码。
 
 规则可用 config/stock.yaml 的 market.etf 段覆盖：
     market:
@@ -49,7 +60,7 @@ class Instrument:
     """单个标的的交易规则（不可变，可缓存）。"""
     code: str
     name: str = ""
-    kind: str = "stock"            # stock / etf
+    kind: str = "stock"            # stock / etf / fund / hk / us / crypto / fut
     t0: bool = False               # True=当日可卖（T+0）
     limit_pct: float = STOCK_LIMIT_PCT
     stamp_tax: bool = True         # 卖出是否收印花税
@@ -120,6 +131,31 @@ class MarketModel:
     def classify(self, code, name=""):
         code = str(code or "").lower()
         name = str(name or "")
+        # --- 多市场前缀 (data.unified 编码) 优先判定 ---
+        if code.startswith("crypto:"):
+            return Instrument(code=code, name=name, kind="crypto", t0=True,
+                              limit_pct=1.0, stamp_tax=False,
+                              transfer_fee=False, lot_size=0)
+        if code.startswith("us:"):
+            return Instrument(code=code, name=name, kind="us", t0=True,
+                              limit_pct=1.0, stamp_tax=False,
+                              transfer_fee=False, lot_size=1)
+        if code.startswith("hk:"):
+            return Instrument(code=code, name=name, kind="hk", t0=True,
+                              limit_pct=1.0, stamp_tax=True,
+                              transfer_fee=True, lot_size=1)
+        if code.startswith("fut:"):
+            # 国内期货主力连续: T+0, 仅佣金; 涨跌停/保证金/乘数未建模
+            return Instrument(code=code, name=name, kind="fut", t0=True,
+                              limit_pct=1.0, stamp_tax=False,
+                              transfer_fee=False, lot_size=1)
+        if code.startswith("fund:") or (
+                len(code) == 6 and code.isdigit()
+                and code.startswith(("00", "01", "02"))):
+            # 场外基金 6 位数字 (联接C多为 00/01 开头) 或显式 fund: 前缀
+            return Instrument(code=code, name=name, kind="fund", t0=False,
+                              limit_pct=1.0, stamp_tax=False,
+                              transfer_fee=False, lot_size=1)
         kind = "etf" if is_etf_code(code) else "stock"
         return Instrument(
             code=code, name=name, kind=kind,

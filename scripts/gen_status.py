@@ -5,6 +5,7 @@
 内容：
 - 股票模拟盘：账户概览 / 资产曲线 / 最新决策 / 候选 / 持仓 / 近期成交
 - 回测数据：净值对比、回撤、年化对比、年度收益、月度热力图、全量指标表
+- 多市场 sm701（基金/港/美/加密/期货）：实盘快照 + 回测净值 vs 基准 + 信号/持仓/成交
 - 旧版基金模拟盘（etf-c）概览与净值曲线
 - 机器状态（/tmp/health.json）
 
@@ -570,10 +571,21 @@ def stock_section(base, mk=None):
     eq_pts = [(d["date"], (d.get("account") or {}).get("total_asset"))
               for d in dailies if (d.get("account") or {}).get("total_asset")]
     if len(eq_pts) >= 2:
+        vals = [v for _, v in eq_pts]
+        span = max(vals) - min(vals)
+        # 自适应单位：波动小（小资金/持仓少）时万保留2位会全挤成同一数
+        if span >= 20000:
+            yf = lambda v: f"{v / 10000:.2f}万"
+        elif span >= 2000:
+            yf = lambda v: f"{v / 10000:.3f}万"
+        elif span >= 200:
+            yf = lambda v: f"{v:.0f}"
+        else:
+            yf = lambda v: f"{v:.1f}"
         nav = line_chart(
             [{"name": "股票模拟盘", "color": RED, "pts": eq_pts,
               "area": True, "w": 1.8}],
-            y_fmt=lambda v: f"{v / 10000:.2f}万")
+            y_fmt=yf)
         chart = (nav + f'<div class="legend"><span class="lg">初始 '
                  f'{capital:,.0f} 元</span></div>')
     else:
@@ -872,6 +884,194 @@ def backtest_section(base):
 """
 
 
+MULTI_META = [
+    ("fund", "基金场外", ORANGE, "元"),
+    ("hk", "港股", RED, "HKD"),
+    ("us", "美股", BLUE, "USD"),
+    ("crypto", "加密", PURPLE, "USDT"),
+    ("fut", "期货", CYAN, "元"),
+]
+
+
+def load_markets_settings(base):
+    """从 config/markets.yaml 提取展示用标量（stdlib-only，正则解析）。"""
+    try:
+        with open(os.path.join(base, "config", "markets.yaml"),
+                  encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return {}
+    out = {}
+    for m in ("fund", "hk", "us", "crypto"):
+        blk = re.search(rf"^\s*{m}:[^\n]*\n((?:[ \t]+[^\n]*\n?)*)", text, re.M)
+        seg = blk.group(1) if blk else ""
+        def g(key, d=""):
+            mm = re.search(rf"^\s*{key}:\s*([^#\n]+)", seg, re.M)
+            return mm.group(1).strip().strip("\"'") if mm else d
+        th = re.search(r"threshold:\s*([0-9.]+)", seg)
+        out[m] = {"enabled": g("enabled", "true"),
+                  "capital": g("capital", "?"),
+                  "max_positions": g("max_positions", "?"),
+                  "threshold": th.group(1) if th else "?"}
+    return out
+
+
+def load_multi_backtest(base, market):
+    pats = sorted(glob.glob(os.path.join(
+        base, "backtest", "results", f"multi-{market}-top*.json")),
+        key=lambda p: os.path.getmtime(p))
+    if not pats:
+        return None
+    d = load_json(pats[-1])
+    return d if isinstance(d, dict) else None
+
+
+def load_multi_live(base, market):
+    """返回 (state, latest_daily)。state 为账户持久化，daily 为当日信号/成交快照。"""
+    state = load_json(os.path.join(base, "sim", "state", f"multi-{market}.json"))
+    files = sorted(glob.glob(os.path.join(
+        base, "memory", "daily", f"multi-{market}-*.json")))
+    daily = load_json(files[-1]) if files else None
+    return state, daily
+
+
+def multi_section(base):
+    cfg = load_markets_settings(base)
+    cards = []
+    charts = []
+    for market, label, color, unit in MULTI_META:
+        st = (cfg.get(market) or {})
+        bt = load_multi_backtest(base, market)
+        state, daily = load_multi_live(base, market)
+        acc = (daily or {}).get("account") or {}
+        total = acc.get("total_asset")
+        cap_txt = st.get("capital", "?")
+        en = str(st.get("enabled", "true")).lower() == "true"
+
+        # --- 回测统计 chips + 曲线 ---
+        if bt and bt.get("equity"):
+            s_ret = float(bt.get("ret", 0)) * 100
+            s_ann = float(bt.get("ann", 0)) * 100
+            s_mdd = float(bt.get("mdd", 0)) * 100
+            s_bench = float(bt.get("bench_ret", 0)) * 100
+            rc = RED if s_ret >= 0 else GREEN
+            bc = RED if s_bench >= 0 else GREEN
+            chips = (f'<div class="stats">'
+                     f'<div class="stat"><div class="v" style="color:{rc}">'
+                     f'{s_ret:+.1f}%</div><div class="k">区间收益</div></div>'
+                     f'<div class="stat"><div class="v">{s_ann:+.1f}%</div>'
+                     f'<div class="k">年化</div></div>'
+                     f'<div class="stat"><div class="v" style="color:{GREEN}">'
+                     f'{s_mdd:.1f}%</div><div class="k">最大回撤</div></div>'
+                     f'<div class="stat"><div class="v" style="color:{bc}">'
+                     f'{s_bench:+.1f}%</div><div class="k">基准等权</div></div>'
+                     f'<div class="stat"><div class="v">{bt.get("trades", 0)}</div>'
+                     f'<div class="k">成交笔数</div></div></div>')
+            series = [{"name": f"{label}策略", "color": color,
+                       "pts": cum_pct(bt["equity"]), "w": 1.8}]
+            if bt.get("bench"):
+                series.append({"name": "等权基准", "color": GRAY,
+                               "dash": "5 4", "pts": cum_pct(bt["bench"]),
+                               "w": 1.3})
+            svg = line_chart(series, y_fmt=fmt_pct_tick)
+            rng = f'{bt.get("start", "?")}~{bt.get("end", "?")}'
+            charts.append(
+                f'<div class="card"><div class="lbl">{label}回测净值 vs 基准'
+                f'（{rng} · Top{bt.get("topk", "?")} · thr{bt.get("thr", "?")}）'
+                f'</div>{svg}{legend(series)}</div>'
+                f'<div class="card"><div class="lbl">{label}回测指标</div>'
+                f'{chips}<div class="mut">样本 {bt.get("codes", "?")} 只 · '
+                f'{bt.get("days", "?")} 日 · 最终 {bt.get("final", "?"):,} {unit}'
+                f'</div></div>')
+        else:
+            charts.append(
+                f'<div class="card"><div class="lbl">{label}回测</div>'
+                f'<div class="empty">暂无（backtest/results/multi-{market}-top*.json）'
+                f'</div></div>')
+
+        # --- 实盘快照 ---
+        if total is not None:
+            try:
+                cap = float(st.get("capital") or 0) or None
+            except (TypeError, ValueError):
+                cap = None
+            if cap:
+                g = total - cap
+                gc = RED if g >= 0 else GREEN
+                head = (f'<div class="big">{total:,.2f} {unit}</div>'
+                        f'<div class="lbl">本金 {cap:,.0f} · '
+                        f'<span style="color:{gc}">{g:+,.0f} / '
+                        f'{g / cap * 100:+.2f}%</span></div>')
+            else:
+                head = f'<div class="big">{total:,.2f} {unit}</div>'
+        elif state:
+            head = (f'<div class="big">{float(state.get("cash", 0)):,.2f} {unit}</div>'
+                    f'<div class="lbl">现金（尚无每日快照，等待首次实盘）</div>')
+        else:
+            head = ('<div class="empty">暂无实盘快照'
+                    '（`python -m sim.multi_run --market '
+                    f'{market}` 后生成）</div>')
+        sigs = ((daily or {}).get("signals") or [])[:8]
+        if sigs:
+            srows = "".join(
+                f"<tr><td>{html.escape(str(s.get('code', '')))}</td>"
+                f"<td class='r'>{s.get('score', '')}</td>"
+                f"<td>{html.escape(str(s.get('reason', ''))[:60])}</td></tr>"
+                for s in sigs)
+            sig_card = ('<table><tr><th>代码</th><th class="r">评分</th>'
+                        '<th>理由</th></tr>' + srows + '</table>')
+        else:
+            sig_card = (f'<div class="empty">暂无信号（{(daily or {}).get("date", "—")}）'
+                        f'——阈值 thr{st.get("threshold", "?")} 下空仓即观望</div>')
+        pos = (acc.get("positions") or {})
+        if pos:
+            prows = "".join(
+                f"<tr><td>{html.escape(c)}</td>"
+                f"<td class='r'>{p.get('shares', 0)}</td>"
+                f"<td class='r'>{p.get('price', 0)}</td>"
+                f"<td class='r' style='color:"
+                f"{RED if (p.get('pnl_pct') or 0) >= 0 else GREEN}'>"
+                f"{(p.get('pnl_pct') or 0):+.2f}%</td></tr>"
+                for c, p in pos.items())
+            pos_card = ('<table><tr><th>代码</th><th class="r">数量</th>'
+                        '<th class="r">现价</th><th class="r">盈亏</th></tr>'
+                        + prows + '</table>')
+        else:
+            pos_card = '<div class="empty">空仓</div>'
+        trs = ((daily or {}).get("trades") or [])[-6:][::-1]
+        if trs:
+            trows = "".join(
+                f"<tr><td style='color:"
+                f"{RED if str(t.get('side', '')).upper() == 'BUY' else GREEN};"
+                f"font-weight:bold'>{html.escape(str(t.get('side', '')))}</td>"
+                f"<td>{html.escape(str(t.get('code', '')))}</td>"
+                f"<td class='r'>{t.get('shares', '')}</td>"
+                f"<td class='r'>@{t.get('price', '')}</td></tr>"
+                for t in trs)
+            tr_card = ('<table><tr><th>方向</th><th>代码</th>'
+                       '<th class="r">数量</th><th class="r">价格</th></tr>'
+                       + trows + '</table>')
+        else:
+            tr_card = '<div class="empty">暂无成交</div>'
+        date = (daily or {}).get("date", "—")
+        flag = "" if en else ' <span class="warn">已禁用</span>'
+        cards.append(
+            f'<div class="card"><div class="lbl">{label}{flag} · 实盘（{date}）</div>'
+            f'{head}'
+            f'<div class="mut">Top{st.get("max_positions", "?")} · '
+            f'thr{st.get("threshold", "?")} · 本金 {cap_txt} {unit}</div></div>'
+            f'<div class="card"><div class="lbl">{label}最新信号</div>{sig_card}</div>'
+            f'<div class="card"><div class="lbl">{label}持仓</div>{pos_card}</div>'
+            f'<div class="card"><div class="lbl">{label}近期成交</div>{tr_card}</div>')
+    return f"""
+<h2 id="multi">多市场 sm701（基金/港/美/加密/期货）</h2>
+<div class="sub2">sm701 44维暂代因子（A股训练、域外推）· T+1 收盘执行 ·
+TopK 轮动 + 最少持有天数降频 · 低于阈值空仓即观望，不硬买</div>
+{''.join(cards)}
+{''.join(charts)}
+"""
+
+
 def fund_section(base):
     d = load_json(os.path.join(base, "backtest", "results", "latest.json"))
     records = (d or {}).get("records") or []
@@ -941,56 +1141,70 @@ def sys_section(health_path):
 
 CSS = """
 *{box-sizing:border-box}
-body{font-family:Helvetica,Arial,sans-serif;margin:0;padding:14px 12px 24px;
-background:#101114;color:#e8e8e8;font-size:15px;-webkit-text-size-adjust:100%}
-h1{font-size:18px;margin:0 0 2px;color:#fff}
-h2{font-size:15px;margin:22px 0 6px;color:#fff;border-left:3px solid #4da3ff;
-padding-left:8px}
-.sub{font-size:12px;color:#888;margin-bottom:10px}
-.sub2{font-size:11.5px;color:#8a8f98;margin:-4px 0 8px;line-height:1.6}
-.nav{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 6px}
-.nav a{font-size:12px;color:#cfd3da;background:#1a1c20;border:1px solid #2a2d33;
-border-radius:999px;padding:3px 10px;text-decoration:none}
-.card{background:#1a1c20;border-radius:8px;padding:11px 12px;margin-bottom:10px}
-.big{font-size:28px;font-weight:bold;color:#fff;word-break:break-all}
-.lbl{font-size:12px;color:#999;margin-bottom:4px}
-.mut{font-size:11px;color:#8a8f98;line-height:1.6;margin-top:4px}
-.empty{font-size:12px;color:#777;padding:6px 0}
-table{width:100%;border-collapse:collapse;font-size:13px;margin-top:2px}
-th{font-size:11px;color:#8a8f98;font-weight:normal;text-align:left;
-padding:3px 2px;border-bottom:1px solid #2a2d33}
-td{padding:4px 2px;color:#ccc;border-bottom:1px solid #202329;vertical-align:top}
+html{scroll-behavior:smooth}
+body{font-family:Helvetica,Arial,sans-serif;margin:0;padding:16px 14px 28px;
+background:#101114;color:#e8e8e8;font-size:17px;line-height:1.45;
+-webkit-text-size-adjust:100%;touch-action:manipulation;
+-webkit-tap-highlight-color:transparent}
+h1{font-size:22px;margin:0 0 3px;color:#fff}
+h2{font-size:18px;margin:26px 0 8px;color:#fff;border-left:4px solid #4da3ff;
+padding-left:10px;scroll-margin-top:76px}
+.sub{font-size:13px;color:#888;margin-bottom:10px}
+.sub2{font-size:13px;color:#8a8f98;margin:0 0 10px;line-height:1.6}
+.nav{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 8px;
+position:sticky;top:0;z-index:20;background:#101114;padding:8px 0}
+.nav a{font-size:14px;color:#cfd3da;background:#1a1c20;border:1px solid #2a2d33;
+border-radius:999px;padding:0 16px;min-height:44px;display:inline-flex;
+align-items:center;text-decoration:none;touch-action:manipulation}
+.nav a:active{background:#22262d}
+.card{background:#1a1c20;border-radius:10px;padding:14px;margin-bottom:12px}
+.big{font-size:34px;font-weight:bold;color:#fff;word-break:break-all}
+.lbl{font-size:13px;color:#999;margin-bottom:4px}
+.mut{font-size:13px;color:#8a8f98;line-height:1.65;margin-top:5px}
+.empty{font-size:13px;color:#777;padding:8px 0}
+table{width:100%;border-collapse:collapse;font-size:14.5px;margin-top:4px}
+th{font-size:12.5px;color:#8a8f98;font-weight:normal;text-align:left;
+padding:7px 4px;border-bottom:1px solid #2a2d33}
+td{padding:9px 4px;color:#ccc;border-bottom:1px solid #202329;vertical-align:top}
 td.r,th.r{text-align:right}
 .scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
-.scroll table{min-width:560px}
-.heat{table-layout:fixed;font-size:10.5px}
-.heat th{text-align:center;padding:2px 0}
-.heat td{text-align:center;padding:3px 0;border:none;font-size:10.5px;
+.scroll table{min-width:640px}
+.heat{table-layout:fixed;font-size:12px}
+.heat th{text-align:center;padding:4px 0}
+.heat td{text-align:center;padding:5px 0;border:none;font-size:12px;
 border-radius:2px}
-.legend{margin-top:6px;display:flex;flex-wrap:wrap;gap:10px}
-.lg{font-size:11px;color:#cfd3da;display:inline-flex;align-items:center;gap:4px}
-.lg i{width:12px;height:3px;border-radius:2px;display:inline-block}
-.badge{display:inline-block;font-size:10.5px;border:1px solid #888;border-radius:3px;
-padding:0 5px;margin-right:5px;vertical-align:1px}
-.order{margin-top:7px;font-size:13px;line-height:1.5}
-.why{font-size:11.5px;color:#9aa0a8;margin-top:2px;line-height:1.55}
-.view{font-size:12.5px;color:#ffd34d;line-height:1.6;margin-top:4px}
-details{margin:6px 0;font-size:12px;color:#9aa0a8}
-summary{cursor:pointer;color:#cfd3da;font-size:12px;margin-bottom:4px}
-.banner{font-size:12.5px;border-radius:8px;padding:8px 11px;margin:0 0 10px;
-border:1px solid;line-height:1.5}
+.legend{margin-top:8px;display:flex;flex-wrap:wrap;gap:12px}
+.lg{font-size:12.5px;color:#cfd3da;display:inline-flex;align-items:center;gap:5px}
+.lg i{width:14px;height:4px;border-radius:2px;display:inline-block}
+.badge{display:inline-block;font-size:12px;border:1px solid #888;border-radius:4px;
+padding:1px 7px;margin-right:6px;vertical-align:1px}
+.order{margin-top:8px;font-size:14.5px;line-height:1.55}
+.why{font-size:13px;color:#9aa0a8;margin-top:3px;line-height:1.6}
+.view{font-size:14px;color:#ffd34d;line-height:1.6;margin-top:5px}
+details{margin:8px 0;font-size:14px;color:#9aa0a8}
+summary{cursor:pointer;color:#cfd3da;font-size:14px;margin-bottom:4px;
+padding:6px 0;min-height:36px;touch-action:manipulation}
+.banner{font-size:14px;border-radius:10px;padding:10px 13px;margin:0 0 12px;
+border:1px solid;line-height:1.55}
 .banner.open{background:#12241a;border-color:#1f4d33;color:#8fe3ac}
 .banner.closed{background:#2a2118;border-color:#5a3d1e;color:#ffc078}
 .banner b{font-weight:bold}
-.stats{display:flex;flex-wrap:wrap;gap:8px}
-.stat{flex:1 1 30%;min-width:86px;background:#14161a;border-radius:8px;
-padding:8px 10px}
-.stat .v{font-size:17px;font-weight:bold;color:#fff;white-space:nowrap}
-.stat .k{font-size:10.5px;color:#8a8f98;margin-top:1px}
+.stats{display:flex;flex-wrap:wrap;gap:10px}
+.stat{flex:1 1 28%;min-width:120px;background:#14161a;border-radius:10px;
+padding:11px 12px}
+.stat .v{font-size:20px;font-weight:bold;color:#fff;white-space:nowrap}
+.stat .k{font-size:12px;color:#8a8f98;margin-top:2px}
 tr.mine td{background:#1e2430}
 .warn{color:#ffc078}
-.foot{font-size:11px;color:#666;margin-top:16px;text-align:center;line-height:1.7}
+.foot{font-size:12.5px;color:#666;margin-top:18px;text-align:center;line-height:1.7}
 .foot a{color:#4da3ff;text-decoration:none}
+@media (max-width:560px){
+  body{font-size:16px;padding:12px 10px 22px}
+  h1{font-size:20px}h2{font-size:17px;margin-top:22px}
+  .big{font-size:28px}
+  .stat{flex:1 1 46%;min-width:100px}
+  .nav a{font-size:13px;padding:0 13px}
+}
 """
 
 
@@ -998,6 +1212,7 @@ def build(base, health, out):
     mk = market_info(base)
     stock = stock_section(base, mk)
     backtest = backtest_section(base)
+    multi = multi_section(base)
     fund = fund_section(base)
     sys_part = sys_section(health)
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -1008,6 +1223,7 @@ def build(base, health, out):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="900">
 <title>AI Quant · 模拟盘 &amp; 回测</title>
 <style>{CSS}</style>
 </head>
@@ -1016,11 +1232,12 @@ def build(base, health, out):
 <div class="sub">常驻模拟盘 + 全缓存回测 · 页面更新 {now}</div>
 {banner}
 <nav class="nav">
-<a href="#live">模拟盘</a><a href="#bt">回测</a><a href="#fund">基金</a>
+<a href="#live">模拟盘</a><a href="#bt">回测</a><a href="#multi">多市场</a><a href="#fund">基金</a>
 <a href="#sys">机器</a>
 </nav>
 {stock}
 {backtest}
+{multi}
 {fund}
 {sys_part}
 <div class="foot">自动生成 · 每30分钟刷新 · <code>scripts/gen_status.py</code><br>

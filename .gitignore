@@ -21,3 +21,6 @@ scripts/cli/stock_fetch.log*
 # 全球日K快照（1.3G，build_global_daily.py 生成，U盘/快照分发，不入库）
 data/global_daily.db*
 .pytest_cache/
+
+# sm701 分市场 production 模型 (约100MB, 从桌面拷贝, 不入库)
+vendors/sm701/production/

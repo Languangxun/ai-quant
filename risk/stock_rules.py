@@ -57,8 +57,10 @@ class StockRiskManager:
         """涨跌停附近禁止成交（涨停买不到 / 跌停卖不出）。"""
         if not self.check_limit or not prev_close or prev_close <= 0:
             return False
+        lim = float(getattr(inst, "limit_pct", 0.10) or 0.10)
+        if lim >= 0.99:
+            return False  # fund/hk/us/crypto 无涨跌停, 跳过
         chg = price / prev_close - 1.0
-        lim = inst.limit_pct
         if side == "BUY" and chg >= lim - 0.002:
             return True
         if side == "SELL" and chg <= -lim + 0.002:
@@ -96,6 +98,21 @@ class StockRiskManager:
             return RiskDecision(False, STATUS_NO_CHANGE, "金额不足",
                                 instrument=inst)
         lot = inst.lot_size
+        if not lot or lot <= 0:
+            # crypto 小数份额: 按金额直接折算, 保留 6 位小数
+            shares = round(float(amount) / price, 6) if price else 0.0
+            if shares <= 0:
+                return RiskDecision(False, STATUS_NO_CHANGE, "金额不足",
+                                    instrument=inst)
+            try:
+                max_cash = float(getattr(self.account, "cash", 0.0))
+            except Exception:
+                max_cash = 0.0
+            if shares * price > max_cash + 1e-9:
+                return RiskDecision(False, STATUS_NO_CHANGE, "现金不足",
+                                    instrument=inst)
+            return RiskDecision(True, STATUS_VALIDATED, "", shares=shares,
+                                amount=shares * price, instrument=inst)
         shares = int(amount / price)
         shares -= shares % lot
         if shares <= 0:

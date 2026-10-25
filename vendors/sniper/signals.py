@@ -159,3 +159,12 @@ def compute_lgbm(bars: dict, market: str = "HK", **params) -> dict:
 
 
 SIGNAL_ALGOS["lgbm"] = compute_lgbm
+
+
+def compute_lgbm_us_short(bars: dict, market: str = "US", **params) -> dict:
+    """美股超短线 LightGBM（5m 未来 3 根，可做空）。"""
+    from market_sniper.us_lgbm_model import run_algo
+    return run_algo(bars, market=market, **params)
+
+
+SIGNAL_ALGOS["lgbm_us_short"] = compute_lgbm_us_short

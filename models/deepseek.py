@@ -17,6 +17,54 @@ REQUEST_TIMEOUT = 60
 API_MAX_RETRIES = 2
 PARSE_MAX_RETRIES = 2
 
+QUOTA_STATUS = {401, 402, 403, 429}
+QUOTA_MARKERS = (
+    "insufficient balance",
+    "insufficient_quota",
+    "quota exceeded",
+    "billing",
+    "credit",
+    "余额不足",
+    "欠费",
+    "error code: 401",
+    "error code: 402",
+    "error code: 403",
+    "error code: 429",
+)
+
+
+def is_quota_error(exc):
+    for attr in ("status_code", "code"):
+        try:
+            value = getattr(exc, attr, None)
+            if value in QUOTA_STATUS:
+                return True
+        except TypeError:
+            pass
+    text = str(exc or "").lower()
+    return any(marker in text for marker in QUOTA_MARKERS)
+
+
+NETWORK_MARKERS = (
+    "connection error",
+    "connection refused",
+    "connection reset",
+    "network is unreachable",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "max retries exceeded",
+    "timed out",
+    "timeout",
+    "ssl",
+    "eof occurred",
+    "remotedisconnected",
+)
+
+
+def is_network_error(exc):
+    text = str(exc or "").lower()
+    return any(marker in text for marker in NETWORK_MARKERS)
+
 
 def extract_json(text):
     """从模型输出中稳健地提取 JSON（容忍 markdown 围栏和多余文字）。"""

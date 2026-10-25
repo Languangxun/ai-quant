@@ -89,7 +89,11 @@ def load_inbox_signals():
 
 
 def live_prices(codes):
-    """实时行情：{code: quote}；失败回退缓存最新收盘。"""
+    """实时行情：{code: quote}；失败回退缓存最新收盘（换算到实际价口径）。
+
+    缓存存的是后复权(hfq)价（浦发 164.87），实时行情是实际价（9.5），
+    直接混用会让持仓盈亏虚增十倍以上，必须乘 adjust 系数 k 还原。
+    """
     quotes = {}
     for code in codes:
         try:
@@ -101,8 +105,9 @@ def live_prices(codes):
             print(f"[warn] {code} 行情失败: {e}")
         rows = bridge.db_rows(code, tail=1)
         if rows:
-            q = {"name": "", "price": rows[-1]["close"],
-                 "prev_close": rows[-1]["close"], "stale": True}
+            close = bridge.display_price(code, rows[-1]["close"])
+            q = {"name": "", "price": close,
+                 "prev_close": close, "stale": True}
             quotes[code] = q
     return quotes
 
@@ -242,8 +247,9 @@ def main(argv=None):
         if code not in prices:
             rows = bridge.db_rows(code, tail=1)
             if rows:
-                prices[code] = rows[-1]["close"]
-                prev_closes[code] = rows[-1]["close"]
+                close = bridge.display_price(code, rows[-1]["close"])
+                prices[code] = close
+                prev_closes[code] = close
 
     positions = []
     for code in account.position_codes():
@@ -306,6 +312,9 @@ def main(argv=None):
         print(f"决策失败: {err}")
         result = {"market_view": f"模型失败: {err[:80]}", "orders": []}
     else:
+        if result.get("degraded"):
+            print(f"[降级] LLM 不可用，纯代码决策: "
+                  f"{result.get('degrade_reason', '')[:120]}")
         print(f"市场观点: {result.get('market_view', '')}")
         for o in result.get("orders", []):
             print(f"  指令: {o.get('action')} {o.get('code')} "
@@ -342,6 +351,8 @@ def main(argv=None):
         "date": str(trade_date),
         "market_view": (result or {}).get("market_view"),
         "orders": (result or {}).get("orders") or [],
+        "degraded": bool((result or {}).get("degraded")),
+        "degrade_reason": (result or {}).get("degrade_reason"),
         "trades": [t.to_dict() for t in trades],
         "skipped": skipped,
     }
