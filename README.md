@@ -15,6 +15,9 @@ VALIDATED → FILLED / REJECTED / NO_CHANGE）。
 （TradableEntity/Event + record/query + Factor/Trader），仅借鉴思想、无源码复制，
 归因见 `THIRD_PARTY_NOTICES.md`，说明见 `docs/REFACTOR_qa_zvt.md`。
 
+2026-11 起标准测试基线：`python3 -m pytest -q` **187 passed**
+（含板块波动监控、国外搜索解析、盘口/竞价工具、事件检索合并外网结果）。
+
 ## 目录
 
 | 路径 | 用途 |
@@ -35,12 +38,12 @@ VALIDATED → FILLED / REJECTED / NO_CHANGE）。
 | `backtest/` | 回测：`stock_engine.py` 股票组合全缓存回测 + 基金引擎 |
 | `data/` | 行情、基金映射、特征、历史缓存；`data/stock/cli_bridge.py` 桥接 CLI |
 | `memory/` | 记忆与收件箱（`inbox/` 推送落点，`daily/` 每日总结/复盘） |
-| `scripts/` | 运维脚本（状态页 `gen_status.py`、账户重置 `reset_account.py`）；`scripts/cli/` 为独立单文件 CLI（生成物，勿手改） |
+| `scripts/` | 运维脚本（状态页 `gen_status.py`、重置 `reset_account.py`、盘前 `premarket_research.py`、盘中 `intraday_research.py`、波动激活 `volatility_watcher.py` + `../agent/volatility_watch.py`、竞价快照 `auction_snapshot.py`、国外搜索 `foreign_search.py`、Clash 订阅 `clash_update.py`、密钥检查 `check_secrets.py`）；`scripts/cli/` 为独立单文件 CLI（生成物，勿手改） |
 | `archive/` | 历史备份归档（`*.bak*`、旧快照，不参与运行） |
 
 ## 股票模拟盘
 
-- **实盘（每交易日多个时点，cron `python -m sim.run`）**：
+- **实盘（事件驱动激活，`systemctl --user status aiquant-watcher`）**：
   交易日闸门（周末 + `config/holidays.json` 休市日跳过，`--force` 强制）
   → CLI 缓存选股 → 腾讯实时行情 → `deepseek-v4.1-flash`（`deepseek-flash`）
   组合决策 → `StockExecutor` 按 A股规则成交 → 状态/复盘/RAG 记忆/U 盘快照
@@ -48,11 +51,22 @@ VALIDATED → FILLED / REJECTED / NO_CHANGE）。
   .venv/bin/python -m sim.run --dry-run --no-rag   # 试跑
   .venv/bin/python -m sim.run --mode fund          # 旧版 etf-c 基金模式
   ```
-  - **日内多时点**：`config/stock.yaml` `intraday.times`（默认
-    `10:00/11:00/13:30/14:45`，cron 需同步）每时点独立扫描/决策/执行；
-    当日 orders/trades/复盘自动合并（`sim/intraday.py`）。
+  - **日内多时点（事件驱动）**：A 股决策不再按固定 cron 点跑。
+    `scripts/volatility_watcher.py --loop` 常驻（Pi systemd
+    `aiquant-watcher`），盘中每分钟拉东财全行业板块指数快照，
+    波动触发（见下）或静默满 60 分钟即激活一轮「资料刷新 + 决策」；
+    护栏：每日 ≤`volatility_watch.max_activations`（8）次、
+    两次间隔 ≥`min_cooldown_min`（15）分钟，`flock logs/sim.lock`
+    防并发决策。`intraday.times` 仍保留作回退参考。
     限额：`max_buys_per_day`（默认 3，含加仓）、`once_per_code_per_day`
     （默认开，同票当日不重复买）；T+1 不变（当日买入不可卖）。
+  - **板块波动监控**：`agent/volatility_watch.py` 快照预筛（成交额
+    vs 自身近 60 快照均值、振幅 ≥2.2%、|涨跌| ≥1.8%）→ 拉板块日K
+    复核 **ATR**（当日 TR/ATR14 ≥1.8）、**布林带宽** (20,2) 近 60 日
+    z ≥2.0、**量能**（今日量/MA5 ≥2.0），三者至少占二即判"波动大"；
+    阈值都在 `config/stock.yaml` `volatility_watch`。状态存
+    `sim/state/volatility_watch.json`，`volatility_watcher.py
+    --status/--once/--force` 可查可手动。
   - **本金可配**：`capital`（首次建盘生效）或 `--capital`；改本金/重来用
     `scripts/reset_account.py --capital 20000 --yes`（旧账户归档到
     `sim/state/archive/`，`--show` 只看概览）。
@@ -80,13 +94,15 @@ VALIDATED → FILLED / REJECTED / NO_CHANGE）。
     3 秒缓存）同步到 `agent/toolbox.get_orderbook` 与 `sim/stock_run`
     决策上下文；`config/stock.yaml` `orderbook.execution_pricing=true` 时
     BUY 按卖一、SELL 按买一模拟成交，涨停无卖单不买、跌停无买单不卖。
-  - **盘中/午休资料**：`scripts/intraday_research.py` 在 10:30 / 12:30 /
-    14:10 刷新事件与 A股主线，存 `memory/daily/intraday-日期-HHMM.json`；
-    13:30 决策读取最新快照，盘中事件风险只能加严、不降级盘前结论。
+  - **盘中/午休资料**：`scripts/intraday_research.py` 波动激活时自动跑
+    （事件 + A股主线，存 `memory/daily/intraday-日期-HHMM.json`），
+    仅 12:30 午休保留固定 cron 补外部事件（时段无行情）；决策读取最新
+    快照，盘中事件风险只能加严、不降级盘前结论。
   - **盘前量化预测**：08:30 为持仓 + 候选生成 T+1/T+5/T+10 预测快照
     （`agent/predictor.py`，CLI `analyze(quick=True)`，30 分钟缓存），
     含多日累积分位、P25/P75、上行概率、相似样本与幽灵K线；
-    10:00 起并入候选/持仓上下文；盘中模型仍可用 `get_prediction` 复核。
+    任何一轮决策（波动激活触发）自动并入候选/持仓上下文；盘中模型仍可用
+    `get_prediction` 复核。
   - **事件风险覆盖**：盘前 LLM 输出结构化 `event_risk`（level/posture/
     risk_score/受益/受损/动作，解析失败用关键词规则兜底），决策模型可在
     实时新闻下修正；`sim/stock_run.py` 按 `config/stock.yaml` `event_risk`
@@ -174,7 +190,9 @@ cd scripts/cli && python3 stock_predict.py 000725
 |---|---|---|
 | 决策 | `config/model.yaml` → `deepseek-flash` | DeepSeek-V4.1-Flash，`api.deepseek.com`，Key 在 `.env`；支持 GUI 风格工具调用（可配） |
 | 联网检索 | `config/model.yaml` → `models.search` | 决策前自动调用 DeepSeek Search API（重大事件 + 大盘 + 候选/持仓）；事件检索中英文交叉、按新鲜度/来源去重排序，结果 30 分钟缓存；失败静默降级，回测禁用（防未来信息泄漏） |
-| 盘前资料 | `scripts/premarket_research.py`（08:30 cron） | 每交易日盘前先搜特朗普/关税/地缘/美联储主导事件，再补宏观/外盘/政策/板块 + 持仓/候选 T+1/T+5/T+10 预测 + 结构化事件风险，存 `memory/daily/premarket-*.json`，10:00 决策自动参考；`--email` 可推送盘前邮件 |
+| 盘前资料 | `scripts/premarket_research.py`（08:30 cron） | 每交易日盘前先搜特朗普/关税/地缘/美联储主导事件，再补宏观/外盘/政策/板块 + 持仓/候选 T+1/T+5/T+10 预测 + 结构化事件风险，存 `memory/daily/premarket-*.json`，当日各轮决策自动参考；`--email` 可推送盘前邮件 |
+| 盘中激活 | `scripts/volatility_watcher.py`（aiquant-watcher 常驻） | 每分钟拉板块指数快照，波动（ATR/布林带宽/量能占二）或静默 60 分钟强制激活；资料刷新 + flock 决策 |
+| 竞价快照 | `scripts/auction_snapshot.py`（09:26 cron） | 集合竞价五档/参考价/买卖盘不平衡存 `memory/daily/auction-*.json`，当轮决策自动参考 |
 | 邮件反馈 | `~/.config/ai-quant/mail.env`（IMAP） | 读取用户回复邮件，近 7 天反馈并入决策上下文；只提取合理建议、不违反风控；失败自动用缓存 |
 | 缓存 | 一天一个会话（`sim/state/llm_daily_*.json`） | 当日历史多轮追加，DeepSeek 前缀缓存命中（约 1/10 价），跨天自动新会话 |
 | 记忆 | Ollama `qwen3-embedding:0.6b` | 相似历史检索（RAG），失败自动降级 |
@@ -189,10 +207,14 @@ cd scripts/cli && python3 stock_predict.py 000725
 报道 + A股传导），去重排序后作为“外部事件主线”，再补 A股盘前/隔夜外盘/
 板块资金；同时用 CLI `analyze(quick=True)` 给持仓+候选生成 T+1/T+5/T+10
 预测。LLM 输出四段摘要与结构化 `event_risk`，存
-`memory/daily/premarket-*.json` 与 `盘前-*.md`。10:00 股票/基金决策自动读取
-当日文件，候选/持仓自动挂预测，事件风险参与订单收紧。非交易日自动跳过；
-`--force` 手动试跑，`--no-predict` 跳过预测，`--focus "特朗普 关税"`
-增加聚焦检索。
+`memory/daily/premarket-*.json` 与 `盘前-*.md`。其后任何一轮
+股票决策（波动激活触发）自动读取当日文件，候选/持仓自动挂预测，
+事件风险参与订单收紧。非交易日自动跳过；`--force` 手动试跑，
+`--no-predict` 跳过预测，`--focus "特朗普 关税"` 增加聚焦检索。
+
+09:26 竞价快照：cron 跑 `scripts/auction_snapshot.py`，抓持仓/候选的
+五档挂单与集合竞价阶段（`memory/daily/auction-日期.json`），开盘缺口、
+竞价量、买卖盘不平衡并入第一轮决策上下文（不直接改订单）。
 
 ## Pi 部署 / Clash / 国外搜索
 
@@ -220,7 +242,7 @@ X 的网页检索可能被登录/风控挡住；要稳定查 X，在
 盘中/午休不再按固定点跑：**板块波动监控（事件驱动）**
 `agent/volatility_watch.py` + `scripts/volatility_watcher.py --loop`
 每分钟拉东财全行业板块指数快照，用量比/振幅/涨跌预筛，
-对可疑板块复核 ATRTR/ATR14、布林带宽(20,2) z 分数、量比
+对可疑板块复核 ATR（当日 TR/ATR14）、布林带宽(20,2) z 分数、量比
 （三者至少占二才算"波动大"，阈值在 `config/stock.yaml`
 `volatility_watch`）。触发即激活：刷新事件资料 + flock 锁下跑一轮
 `sim.run` 决策。静默超过 60 分钟或无信号也会强制激活一次，防失联。
