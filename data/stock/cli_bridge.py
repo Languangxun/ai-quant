@@ -344,6 +344,44 @@ def quote(code):
     return load().fetch_quote(code)
 
 
+def order_book(code, ttl=3.0):
+    """A股五档盘口 + 集合竞价状态（CLI 7.0.3 / GUI v7.0.2 同口径）。
+
+    返回 name/price/prev_close/open/phase/auction/bids/asks/
+    bid_vol/ask_vol/wei_bi/limit_up/limit_down 等；非 A 股抛异常。
+    """
+    return load().fetch_order_book(code, ttl=ttl)
+
+
+def order_book_view(code, levels=3, ttl=3.0):
+    """决策上下文用的紧凑盘口：阶段/竞价/前3档/委比/涨跌停。"""
+    d = order_book(code, ttl=ttl)
+    bids = [[p, v] for p, v in (d.get("bids") or [])[:levels]]
+    asks = [[p, v] for p, v in (d.get("asks") or [])[:levels]]
+    bid1 = bids[0][0] if bids else None
+    ask1 = asks[0][0] if asks else None
+    return {
+        "code": code,
+        "name": d.get("name") or "",
+        "phase": d.get("phase") or "",
+        "auction": bool(d.get("auction")),
+        "price": d.get("price"),
+        "prev_close": d.get("prev_close"),
+        "open": d.get("open"),
+        "bids": bids,
+        "asks": asks,
+        "bid1": bid1,
+        "ask1": ask1,
+        "bid_vol": d.get("bid_vol"),
+        "ask_vol": d.get("ask_vol"),
+        "wei_bi_pct": (round(d.get("wei_bi"), 2)
+                       if d.get("wei_bi") is not None else None),
+        "limit_up": d.get("limit_up"),
+        "limit_down": d.get("limit_down"),
+        "time": d.get("time") or "",
+    }
+
+
 def index_series(code="sh000001"):
     """指数日K（缓存内，如 sh000001）。"""
     return db_rows(code)

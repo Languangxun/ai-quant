@@ -28,7 +28,8 @@ from trading.orders import OrderJournal
 from trading.stock_account import StockAccount
 from trading.stock_executor import StockExecutor
 from data.stock import cli_bridge as bridge
-from memory import otc_memory
+from agent import event_risk as event_risk_mod
+from memory import mail_feedback, otc_memory, premarket
 from scripts.usb_backup import backup as usb_backup
 from sim import intraday
 
@@ -251,6 +252,8 @@ def main(argv=None):
                 prices[code] = close
                 prev_closes[code] = close
 
+    # 盘前预测稍后填充；这里先初始化，避免持仓构建时引用未定义变量。
+    pred_map, sector_map = {}, {}
     positions = []
     for code in account.position_codes():
         shares = account.total_shares(code)
@@ -260,12 +263,33 @@ def main(argv=None):
         inst = market.classify(code, names.get(code, ""))
         positions.append({
             "code": code, "name": inst.name, "kind": inst.kind,
-            "t0": inst.t0, "shares": shares, "cost": round(cost, 4),
+            "t0": inst.t0, "industry": sector_map.get(code, ""),
+            "shares": shares, "cost": round(cost, 4),
             "price": px,
             "pnl_pct": round((px / cost - 1) * 100, 2) if cost else 0.0,
             "pct": round(account.position_pct(code, prices), 2),
             "sellable": account.available_shares(code, str(trade_date)),
         })
+
+    # 五档盘口 + 集合竞价状态（借鉴 GUI 盘口面板 / CLI 7.0.3）：
+    # 只取候选前几名 + 持仓，避免每只都发请求；失败静默跳过。
+    ob_cfg = cfg.get("orderbook") or {}
+    orderbooks = {}
+    if ob_cfg.get("enabled", True):
+        codes_ob = [c["code"] for c in cands[:4]] + account.position_codes()
+        seen_ob = set()
+        for code in codes_ob:
+            code = str(code or "").lower()
+            if not code or code in seen_ob:
+                continue
+            seen_ob.add(code)
+            if len(orderbooks) >= int(ob_cfg.get("max_codes", 6)):
+                break
+            try:
+                orderbooks[code] = bridge.order_book_view(
+                    code, levels=int(ob_cfg.get("levels", 3)))
+            except Exception as e:
+                print(f"[warn] {code} 盘口失败: {e}")
 
     total_asset = account.total_asset(prices)
     context = {
@@ -291,6 +315,7 @@ def main(argv=None):
             "sold_today": sorted(sold_codes),
             "t_plus_1_note": f"今日买入 {next_date} 起可卖",
         },
+        "orderbooks": orderbooks,
         "lessons": otc_memory.load_lessons(5),
         "stock_signals": load_inbox_signals(),
     }
@@ -303,29 +328,111 @@ def main(argv=None):
             print(f"  找到 {len(similar)} 条相似记忆")
     context["similar_history"] = similar
 
+    feedback = mail_feedback.load_for_decision()
+    if feedback:
+        context["user_feedback"] = feedback
+        print(f"  邮件反馈 {len(feedback['items'])} 条已并入决策上下文")
+
+    pre = premarket.load_for_decision(str(trade_date))
+    pred_map, sector_map = {}, {}
+    if pre:
+        context["premarket"] = pre
+        for p in pre.get("predictions") or []:
+            code = str(p.get("code") or "").lower()
+            if code:
+                pred_map[code] = p
+                if p.get("sector"):
+                    sector_map[code] = p["sector"]
+        hit = 0
+        for c in context.get("candidates") or []:
+            p = pred_map.get(str(c.get("code") or "").lower())
+            if p:
+                c["prediction"] = p
+                hit += 1
+        for p in positions:
+            pred = pred_map.get(str(p.get("code") or "").lower())
+            if pred:
+                p["prediction"] = pred
+                hit += 1
+                if pred.get("sector"):
+                    p["industry"] = pred["sector"]
+        print(f"  盘前资料 {len(pre['items'])} 条已并入决策上下文"
+              f"（预测 {len(pre.get('predictions') or [])} 只，"
+              f"匹配 {hit} 个候选/持仓）")
+        print(f"  盘前市场简报：{str(pre.get('market_brief') or '')[:120]}")
+
+    # 事件风险：盘前结构化结果优先；缺失/旧文件用关键词规则兜底。
+    risk = None
+    if pre and isinstance(pre.get("event_risk"), dict):
+        risk = event_risk_mod.normalize(pre["event_risk"])
+    # 盘中/午休快照的事件风险只能加严，不能把盘前风险降级
+    live_risk = (pre or {}).get("intraday_event_risk")
+    if isinstance(live_risk, dict):
+        if risk:
+            risk = event_risk_mod.merge(live_risk, risk, conservative=True)
+        else:
+            risk = event_risk_mod.normalize(live_risk)
+    if not risk:
+        mb = str((pre or {}).get("market_brief") or "")
+        if not mb:
+            try:
+                from agent import market_view
+                mb = market_view.brief()
+            except Exception:
+                mb = ""
+        risk = event_risk_mod.heuristic(
+            (pre or {}).get("items") or [], mb,
+            (pre or {}).get("predictions") or [])
+    context["event_risk"] = risk
+    print(f"  事件风险 {risk['level']}/{risk['posture']} "
+          f"score={risk['risk_score']}：{risk.get('summary', '')[:100]}")
+
     # LLM 决策
     from agent.stock_decision import StockDecisionMaker
     print("deepseek-v4.1-flash 决策中...")
     maker = StockDecisionMaker()
     result, err = maker.decide(context)
+    tool_trace = list(getattr(maker, "last_tool_trace", []) or [])
+    if tool_trace:
+        print(f"  工具调用 {len(tool_trace)} 次: " + ", ".join(
+            f"{t.get('name')}({t.get('elapsed')}s"
+            f"{',失败' if t.get('error') else ''})" for t in tool_trace))
     if err:
         print(f"决策失败: {err}")
         result = {"market_view": f"模型失败: {err[:80]}", "orders": []}
-    else:
+
+    # 模型在实时新闻下的修正 + 确定性事件覆盖（只收紧 BUY）
+    model_risk = (result or {}).get("event_risk")
+    if isinstance(model_risk, dict):
+        # 实时新闻只能加强保护，不能绕过盘前已判定的事件风险
+        risk = event_risk_mod.merge(model_risk, risk, conservative=True)
+        context["event_risk"] = risk
+        print(f"  模型事件修正 {risk['level']}/{risk['posture']} "
+              f"score={risk['risk_score']}")
+    orders_in = (result or {}).get("orders") or []
+    orders_out, overlay_notes = event_risk_mod.overlay_orders(
+        orders_in, context, risk, cfg.get("event_risk") or {})
+    result["orders"] = orders_out
+    if not err:
         if result.get("degraded"):
             print(f"[降级] LLM 不可用，纯代码决策: "
                   f"{result.get('degrade_reason', '')[:120]}")
         print(f"市场观点: {result.get('market_view', '')}")
-        for o in result.get("orders", []):
+        for o in orders_out:
             print(f"  指令: {o.get('action')} {o.get('code')} "
                   f"pos={o.get('position')} conf={o.get('confidence')} "
                   f"{o.get('reason', '')[:40]}")
+    for note in overlay_notes:
+        print(f"  [事件风控] {note}")
 
     # 执行（日内买入闸门：同票当日不重复、每日笔数上限）
     trades = []
     skipped = []
     working = {"trades": list(existing.get("trades") or [])}
+    ob_exec = bool((cfg.get("orderbook") or {}).get(
+        "execution_pricing", True))
     for o in (result or {}).get("orders", []):
+        code = str(o.get("code") or "").lower()
         action = str(o.get("action") or "HOLD").upper()
         if action == "BUY":
             why = intraday.skip_buy(o, working, icfg)
@@ -333,6 +440,34 @@ def main(argv=None):
                 skipped.append(f"{o.get('code')} {why}")
                 print(f"  跳过 {o.get('code')}: {why}")
                 continue
+        # 五档挂单约束：集合竞价/午休不成交；涨停无卖单不买，
+        # 跌停无买单不卖；有盘口时用卖一/买一作为模拟成交价。
+        # 决策上下文里的盘口可能已过几十秒，执行前重新取一次最新档位。
+        ob = None
+        if ob_exec:
+            try:
+                ob = bridge.order_book_view(code, levels=1)
+            except Exception:
+                ob = orderbooks.get(code)
+        if ob:
+            phase = str(ob.get("phase") or "")
+            if phase in ("集合竞价", "竞价撮合", "午间休市", "已收盘",
+                         "开盘前"):
+                skipped.append(f"{o.get('code')} 盘口阶段 {phase} 不成交")
+                print(f"  跳过 {o.get('code')}: 盘口阶段 {phase}")
+                continue
+            if action == "BUY":
+                if not ob.get("ask1"):
+                    skipped.append(f"{o.get('code')} 无卖单（涨停/停牌）")
+                    print(f"  跳过 {o.get('code')}: 无卖单（涨停/停牌）")
+                    continue
+                prices[code] = ob["ask1"]
+            elif action == "SELL":
+                if not ob.get("bid1"):
+                    skipped.append(f"{o.get('code')} 无买单（跌停/停牌）")
+                    print(f"  跳过 {o.get('code')}: 无买单（跌停/停牌）")
+                    continue
+                prices[code] = ob["bid1"]
         if args.dry_run:
             continue
         t = executor.execute_order(o, prices, str(trade_date), prev_closes,
@@ -353,14 +488,22 @@ def main(argv=None):
         "orders": (result or {}).get("orders") or [],
         "degraded": bool((result or {}).get("degraded")),
         "degrade_reason": (result or {}).get("degrade_reason"),
+        "event_risk": risk,
+        "overlay_notes": overlay_notes,
+        "tool_calls": tool_trace,
         "trades": [t.to_dict() for t in trades],
         "skipped": skipped,
     }
-    candidates_out = [
-        {k: c[k] for k in ("code", "name", "kind", "score", "chg", "price")
-         if k in c}
-        for c in context.get("candidates", [])[:20]
-    ]
+    candidates_out = []
+    for c in context.get("candidates", [])[:20]:
+        row = {k: c[k] for k in ("code", "name", "kind", "score", "chg",
+                                 "price") if k in c}
+        pred = c.get("prediction") or {}
+        for key in ("t1_p50", "t1_up_prob", "t5_p50", "t5_up_prob",
+                    "t10_p50", "t10_up_prob"):
+            if pred.get(key) is not None:
+                row[key] = pred[key]
+        candidates_out.append(row)
     summary = intraday.merge_summary(
         existing, session, account.snapshot(prices), candidates_out)
     save_account(args.state, account)

@@ -5,6 +5,7 @@
 - 输出：orders 列表（BUY/SELL + 目标仓位），交由 trading.stock_executor 执行
 - API 余额不足/额度耗尽/鉴权失败时自动降级为纯代码评分轮动
 """
+from models.config import load_model_config
 from models.deepseek import DeepSeekModel, is_network_error, is_quota_error
 from models.stock_prompt import build_system_prompt
 
@@ -100,6 +101,13 @@ class StockDecisionMaker:
         self.client = None
         self.model = None
         self.init_error = None
+        self.last_tool_trace = []
+        try:
+            self.tools_cfg = (
+                load_model_config().get("models", {})
+                .get("decision", {}).get("tools") or {})
+        except Exception:
+            self.tools_cfg = {}
         try:
             self.client = DeepSeekModel(
                 system_prompt=system_prompt or build_system_prompt(),
@@ -109,18 +117,44 @@ class StockDecisionMaker:
         except Exception as e:
             self.init_error = e
 
+    def _attach_tools(self, context):
+        """按当前决策上下文注入工具；失败不影响决策。"""
+        if self.client is None:
+            return
+        if not self.tools_cfg.get("enabled", True):
+            self.client.toolbox = None
+            return
+        try:
+            from agent.toolbox import ToolBox
+            self.client.toolbox = ToolBox(
+                context,
+                search_client=self.client.search_client,
+                predict_timeout=int(self.tools_cfg.get(
+                    "predict_timeout", 45)),
+                max_calls=int(self.tools_cfg.get("max_calls", 8)),
+            )
+        except Exception as e:
+            print(f"[tool] 工具初始化失败（忽略）：{e}", flush=True)
+            self.client.toolbox = None
+
     def decide(self, context):
         """返回 (result_dict, error)。result 含 market_view / orders。"""
+        self.last_tool_trace = []
         if self.client is None:
             return code_only_decision(context, self.init_error), None
+        self._attach_tools(context)
         try:
             result = self.client.analyze(context)
         except Exception as e:
+            self.last_tool_trace = list(
+                getattr(self.client, "last_tool_trace", []) or [])
             if is_quota_error(e):
                 return code_only_decision(context, e), None
             if is_network_error(e):
                 return code_only_decision(context, e), None
             return None, str(e)
+        self.last_tool_trace = list(
+            getattr(self.client, "last_tool_trace", []) or [])
         if not isinstance(result, dict):
             return None, f"模型输出非 JSON 对象: {str(result)[:120]}"
         orders = result.get("orders")

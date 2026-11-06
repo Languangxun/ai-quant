@@ -9,9 +9,39 @@ from openai import OpenAI
 from models.base import BaseModel
 from models.prompt import SYSTEM_PROMPT
 from models.config import load_model_config
+from models.web_search import SEARCH_NOTE, build_from_config
 
 
 load_dotenv()
+
+
+def _normalize_socks_proxy():
+    """httpx 只认 socks5://且需要 socksio；部分桌面环境写成 socks://。
+
+    不处理会在 OpenAI 客户端初始化时直接 ValueError/ImportError，导致
+    LLM 永久降级为纯代码。这里只在进程内兼容：
+    - 装了 socksio：socks:// -> socks5://
+    - 没装：删除无法使用的 ALL_PROXY，退回 HTTP(S)_PROXY 或直连
+    不改用户配置文件。
+    """
+    try:
+        import socksio  # noqa: F401
+        socks_ok = True
+    except ImportError:
+        socks_ok = False
+    for key in ("ALL_PROXY", "all_proxy"):
+        value = os.getenv(key)
+        if not (value and value.lower().startswith("socks://")):
+            continue
+        if socks_ok:
+            os.environ[key] = "socks5://" + value[len("socks://"):]
+        else:
+            # 没有 socksio 时 httpx 完全无法使用该代理，留着只会让
+            # OpenAI 初始化失败；删除后退回 HTTP(S)_PROXY 或直连。
+            os.environ.pop(key, None)
+
+
+_normalize_socks_proxy()
 
 REQUEST_TIMEOUT = 60
 API_MAX_RETRIES = 2
@@ -90,13 +120,16 @@ def extract_json(text):
 class DeepSeekModel(BaseModel):
 
     def __init__(self, system_prompt=None, daily_context=False,
-                 context_dir=None):
+                 context_dir=None, search_client=None):
         """
         daily_context=True 时启用「一天一个会话」：当日历史多轮持久化在
         context_dir/llm_daily_YYYY-MM-DD.json，每次请求 messages =
         [system] + 当日历史 + 新 user 消息。DeepSeek 按前缀缓存计费
         (命中部分约 1/10 价格)，历史段稳定不变 → 逐时点请求大面积命中；
         跨天自动开新会话。仅追加成功(可解析)的轮次，失败重试的前缀不变。
+
+        search_client：决策前自动联网检索（DeepSeek Search API）。
+        None=按 config/model.yaml 自动启用；False=显式关闭；也可注入客户端。
         """
         config = load_model_config()
 
@@ -113,6 +146,16 @@ class DeepSeekModel(BaseModel):
         self.temperature = 0.2
 
         self.system_prompt = system_prompt or SYSTEM_PROMPT
+
+        # 工具调用（借鉴桌面 GUI 的 AI tool calling）：
+        # toolbox 由调用方按决策上下文注入；None=不启用。接口不支持 tools
+        # 时自动降级为纯 JSON，绝不打断交易决策。
+        tools_cfg = decision_config.get("tools") or {}
+        self.tools_enabled = bool(tools_cfg.get("enabled", True))
+        self.tool_max_rounds = max(0, int(tools_cfg.get("max_rounds", 3)))
+        self.toolbox = None
+        self.tools_available = True
+        self.last_tool_trace = []
 
         self.daily_context = daily_context
         _base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -139,6 +182,45 @@ class DeepSeekModel(BaseModel):
             max_retries=API_MAX_RETRIES,
 
         )
+
+        # 自动联网检索：DeepSeek Search API（失败静默降级，不影响决策）
+        if search_client is False:
+            self.search_client = None
+        elif search_client is not None:
+            self.search_client = search_client
+        else:
+            self.search_client = build_from_config(
+                config, api_key=api_key)
+
+    def _augment(self, context):
+        """决策前自动检索并把摘要并入上下文；任何异常都保持原样。"""
+        if not self.search_client or not isinstance(context, dict):
+            return context, 0
+        try:
+            results = self.search_client.gather(context)
+        except Exception as e:
+            print(f"[search] 自动检索失败（忽略）：{e}", flush=True)
+            return context, 0
+        if not results:
+            return context, 0
+        enriched = dict(context)
+        enriched["web_search"] = {
+            "note": SEARCH_NOTE,
+            "results": results,
+        }
+        ev = getattr(self.search_client, "last_event", None)
+        if isinstance(ev, dict) and ev.get("items"):
+            enriched["event_watch"] = {
+                "note": SEARCH_NOTE,
+                "date": ev.get("date"),
+                "days": ev.get("days"),
+                "topics": ev.get("topics"),
+                "salience": ev.get("salience"),
+                "signals": ev.get("signals"),
+                "brief": ev.get("brief"),
+                "items": ev.get("items")[:6],
+            }
+        return enriched, len(results)
 
     # ---------- 日内会话 (前缀缓存优化) ----------
 
@@ -180,12 +262,71 @@ class DeepSeekModel(BaseModel):
         except Exception:
             pass
 
+    @staticmethod
+    def _tools_unsupported(exc):
+        """判断异常是否因接口/模型不支持 tools（而非额度、网络）。"""
+        status = getattr(exc, "status_code", None)
+        text = str(exc or "").lower()
+        if status not in (400, 404, 422) and "tool" not in text:
+            return False
+        return ("tool" in text or "function calling" in text
+                or "function_call" in text)
+
+    def _create(self, messages, use_tools):
+        """一次 API 请求；tools 不被支持时自动去掉并记住该状态。"""
+        kwargs = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "messages": messages,
+        }
+        if (use_tools and self.toolbox is not None
+                and self.tools_available and self.tools_enabled):
+            kwargs["tools"] = self.toolbox.specs()
+            kwargs["tool_choice"] = "auto"
+        try:
+            return self.client.chat.completions.create(**kwargs)
+        except Exception as e:
+            if "tools" in kwargs and self._tools_unsupported(e):
+                self.tools_available = False
+                print("[llm] 接口不支持工具调用，降级为纯 JSON 决策",
+                      flush=True)
+                kwargs.pop("tools", None)
+                kwargs.pop("tool_choice", None)
+                return self.client.chat.completions.create(**kwargs)
+            raise
+
+    @staticmethod
+    def _assistant_tool_msg(message):
+        """OpenAI 消息对象 -> 可回传的 assistant(tool_calls) 字典。"""
+        calls = []
+        for tc in getattr(message, "tool_calls", None) or []:
+            fn = getattr(tc, "function", None)
+            calls.append({
+                "id": getattr(tc, "id", "") or "",
+                "type": "function",
+                "function": {
+                    "name": getattr(fn, "name", "") or "",
+                    "arguments": getattr(fn, "arguments", "") or "{}",
+                },
+            })
+        return {
+            "role": "assistant",
+            "content": message.content or "",
+            "tool_calls": calls,
+        }
+
     def _chat(self, context):
+
+        context, search_count = self._augment(context)
 
         user_msg = json.dumps(
             context,
             ensure_ascii=False
         )
+
+        if search_count:
+            print(f"[search] 自动检索 {search_count} 条，已并入决策上下文",
+                  flush=True)
 
         doc = self._load_history() if self.daily_context else None
 
@@ -209,22 +350,64 @@ class DeepSeekModel(BaseModel):
 
         })
 
-        response = self.client.chat.completions.create(
+        # 工具结果依赖联网检索；调用方未注入 search_client 时补上
+        if self.toolbox is not None:
+            if getattr(self.toolbox, "search_client", None) is None:
+                self.toolbox.search_client = self.search_client
+            self.last_tool_trace = []
 
-            model=self.model,
+        response = None
+        content = ""
+        rounds = 0
+        use_tools = (self.toolbox is not None and self.tools_enabled
+                     and self.tool_max_rounds > 0)
+        while True:
+            response = self._create(messages, use_tools)
+            message = response.choices[0].message
+            calls = list(getattr(message, "tool_calls", None) or [])
+            if not calls:
+                content = message.content or ""
+                break
+            if not use_tools or not self.tools_available:
+                # 接口异常返回了工具调用但无法继续：直接使用文本
+                content = message.content or ""
+                break
+            messages.append(self._assistant_tool_msg(message))
+            for tc in calls:
+                fn = getattr(tc, "function", None)
+                name = getattr(fn, "name", "") or ""
+                raw_args = getattr(fn, "arguments", "") or "{}"
+                try:
+                    args = json.loads(raw_args) if raw_args.strip() else {}
+                except (TypeError, ValueError):
+                    args = {}
+                if not isinstance(args, dict):
+                    args = {}
+                result = self.toolbox.call(name, args)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": getattr(tc, "id", "") or "",
+                    "content": str(result),
+                })
+                print(f"[tool] {name}({json.dumps(args, ensure_ascii=False)[:80]})"
+                      f" -> {str(result)[:120]}", flush=True)
+            rounds += 1
+            if rounds >= self.tool_max_rounds:
+                # 到上限后强制收口，避免无限取数（GET 类工具无副作用）
+                messages.append({
+                    "role": "user",
+                    "content": "工具调用已达上限，请基于已获取的信息直接输出最终 JSON。",
+                })
+                use_tools = False
 
-            temperature=self.temperature,
-
-            messages=messages
-
-        )
-
-        content = response.choices[0].message.content
+        if self.toolbox is not None:
+            self.last_tool_trace = list(getattr(self.toolbox, "trace", []) or [])
 
         result = extract_json(content)
 
         if doc is not None:
-            # 仅在解析成功后追加: 失败重试时前缀与上次完全一致, 仍吃缓存
+            # 仅在解析成功后追加: 失败重试时前缀与上次完全一致, 仍吃缓存。
+            # 只存最终 user/assistant（不含中间 tool 消息），保持跨时点前缀稳定。
             usage = getattr(response, "usage", None)
             hit = getattr(usage, "prompt_cache_hit_tokens", None)
             miss = getattr(usage, "prompt_cache_miss_tokens", None)

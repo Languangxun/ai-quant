@@ -44,7 +44,7 @@ def _make_model(tmpdir, responses):
     os.environ.setdefault("DEEPSEEK_API_KEY", "test-key")
     from models.deepseek import DeepSeekModel
     m = DeepSeekModel(system_prompt="SYS", daily_context=True,
-                      context_dir=str(tmpdir))
+                      context_dir=str(tmpdir), search_client=False)
     m.client = type("C", (), {})()
     m.client.chat = type("S", (), {})()
     m.client.chat.completions = _FakeCompletions(responses)
@@ -112,7 +112,8 @@ def test_day_rollover_fresh_session(tmp_path):
 def test_daily_context_off_by_default(tmp_path):
     os.environ.setdefault("DEEPSEEK_API_KEY", "test-key")
     from models.deepseek import DeepSeekModel
-    m = DeepSeekModel(system_prompt="SYS", context_dir=str(tmp_path))
+    m = DeepSeekModel(system_prompt="SYS", context_dir=str(tmp_path),
+                      search_client=False)
     m.client = type("C", (), {})()
     m.client.chat = type("S", (), {})()
     m.client.chat.completions = _FakeCompletions(

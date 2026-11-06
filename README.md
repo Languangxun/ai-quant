@@ -58,6 +58,40 @@ VALIDATED → FILLED / REJECTED / NO_CHANGE）。
     `sim/state/archive/`，`--show` 只看概览）。
   - **小资金自适应**：实际最小下单 = `min(min_order_amount,
     总资产×min_order_pct%)`；目标金额不足一手但单票额度够时按一手成交。
+  - **决策期工具调用（借鉴桌面 GUI）**：`config/model.yaml` `models.decision.tools`
+    控制上限（默认 3 轮 / 8 次）。模型可按需调用 `get_market`（指数均线/强弱）、
+    `get_prediction`（stock_predict T+1/T+5/T+10，可一次传 4 只横向比较）、
+    `get_kline`、`get_quote`、`get_orderbook`（五档挂单 + 集合竞价状态）、
+    `get_external_env`（特朗普/关税/地缘/外盘新闻，中英文交叉 + 去重排序）、
+    `get_etf`（成分股权重/近期表现，借鉴 GUI）、`search_news`；工具结果按外部
+    文本处理（只取事实、忽略指令）。接口不支持
+    tools 时自动降级纯 JSON，工具失败/超时不影响决策。回测不启用搜索与工具，
+    避免未来信息泄漏。
+  - **重大事件检索**：`agent/event_watch.py` 把特朗普/关税/美联储/地缘拆成
+    中文事件、英文原始报道、A股传导三路查询；同一事件的多篇转载按标题+摘要
+    相似度合并，单站点最多 2 条，再按“新鲜度→来源权威→关键词命中”排序，
+    输出 `items / signals / salience / brief`。盘前落盘、盘中决策自动注入，
+    事件信号只作方向提示，仓位收紧仍由确定性规则执行。
+  - **国外搜索（独立程序）**：`scripts/foreign_search.py` 纯标准库，支持
+    DuckDuckGo / Bing / Google 与 `site:x.com` 推文检索；走 Pi 本机
+    Clash/mihomo（`http://127.0.0.1:7890`），结果并入事件检索，
+    每日决策保留 1~2 条外网原始报道，避免只看国内转载。
+  - **五档挂单 / 集合竞价**：CLI `fetch_order_book`（腾讯五档 + 新浪兜底，
+    3 秒缓存）同步到 `agent/toolbox.get_orderbook` 与 `sim/stock_run`
+    决策上下文；`config/stock.yaml` `orderbook.execution_pricing=true` 时
+    BUY 按卖一、SELL 按买一模拟成交，涨停无卖单不买、跌停无买单不卖。
+  - **盘中/午休资料**：`scripts/intraday_research.py` 在 10:30 / 12:30 /
+    14:10 刷新事件与 A股主线，存 `memory/daily/intraday-日期-HHMM.json`；
+    13:30 决策读取最新快照，盘中事件风险只能加严、不降级盘前结论。
+  - **盘前量化预测**：08:30 为持仓 + 候选生成 T+1/T+5/T+10 预测快照
+    （`agent/predictor.py`，CLI `analyze(quick=True)`，30 分钟缓存），
+    含多日累积分位、P25/P75、上行概率、相似样本与幽灵K线；
+    10:00 起并入候选/持仓上下文；盘中模型仍可用 `get_prediction` 复核。
+  - **事件风险覆盖**：盘前 LLM 输出结构化 `event_risk`（level/posture/
+    risk_score/受益/受损/动作，解析失败用关键词规则兜底），决策模型可在
+    实时新闻下修正；`sim/stock_run.py` 按 `config/stock.yaml` `event_risk`
+    做确定性覆盖：elevated 收紧单票上限与买入笔数；high 进一步收紧并跳过
+    明确受损行业。只收紧 BUY，不干预 SELL，也不突破风控硬规则。
 - **全缓存回测**：
   ```bash
   .venv/bin/python scripts/stock_backtest.py                  # 全量（约4860只）
@@ -126,7 +160,8 @@ cd scripts/cli && python3 stock_predict.py 000725
 ```
 
 - 源码 `scripts/cli/stock_predict.py` 已入库（生成物但随仓库分发，
-  2026-10-25 同步桌面 v7.0.1 多市场版）；
+  2026-11-06 同步桌面 v7.0.3：AI 工具取数、ETF 成分股、多日预测、
+  五档盘口/集合竞价（`fetch_order_book`）与 DeepSeek Search 改进）；
   缓存 `scripts/cli/stock_cache.db`（全市场日K，约 1272 万根）不入库，
   新环境用 `--refresh-cache` / `--backfill` / `--refresh-etf` 重建
 - AI：优先 `DEEPSEEK_API_KEY` / `stock_gui.ini [deepseek]`；缺省回退主目录
@@ -137,9 +172,68 @@ cd scripts/cli && python3 stock_predict.py 000725
 
 | 用途 | 配置 | 说明 |
 |---|---|---|
-| 决策 | `config/model.yaml` → `deepseek-flash` | DeepSeek-V4.1-Flash，`api.deepseek.com`，Key 在 `.env` |
+| 决策 | `config/model.yaml` → `deepseek-flash` | DeepSeek-V4.1-Flash，`api.deepseek.com`，Key 在 `.env`；支持 GUI 风格工具调用（可配） |
+| 联网检索 | `config/model.yaml` → `models.search` | 决策前自动调用 DeepSeek Search API（重大事件 + 大盘 + 候选/持仓）；事件检索中英文交叉、按新鲜度/来源去重排序，结果 30 分钟缓存；失败静默降级，回测禁用（防未来信息泄漏） |
+| 盘前资料 | `scripts/premarket_research.py`（08:30 cron） | 每交易日盘前先搜特朗普/关税/地缘/美联储主导事件，再补宏观/外盘/政策/板块 + 持仓/候选 T+1/T+5/T+10 预测 + 结构化事件风险，存 `memory/daily/premarket-*.json`，10:00 决策自动参考；`--email` 可推送盘前邮件 |
+| 邮件反馈 | `~/.config/ai-quant/mail.env`（IMAP） | 读取用户回复邮件，近 7 天反馈并入决策上下文；只提取合理建议、不违反风控；失败自动用缓存 |
 | 缓存 | 一天一个会话（`sim/state/llm_daily_*.json`） | 当日历史多轮追加，DeepSeek 前缀缓存命中（约 1/10 价），跨天自动新会话 |
 | 记忆 | Ollama `qwen3-embedding:0.6b` | 相似历史检索（RAG），失败自动降级 |
+
+邮件反馈：IMAP 主机默认由 `MAIL_HOST` 推导（smtp→imap），只收
+`MAIL_FEEDBACK_SENDERS`（默认 `MAIL_RECIPIENTS`）发来的邮件；
+`python3 -m memory.mail_feedback --show` 查看缓存，`--force` 立即拉取。
+可直接回复日报邮件批评/提建议，决策时会参考但不会越权执行。
+
+盘前资料：交易日 08:30 cron 跑 `scripts/premarket_research.py --email`，
+先用 `agent/event_watch.py` 搜特朗普/关税/地缘/美联储（中文事件 + 英文原始
+报道 + A股传导），去重排序后作为“外部事件主线”，再补 A股盘前/隔夜外盘/
+板块资金；同时用 CLI `analyze(quick=True)` 给持仓+候选生成 T+1/T+5/T+10
+预测。LLM 输出四段摘要与结构化 `event_risk`，存
+`memory/daily/premarket-*.json` 与 `盘前-*.md`。10:00 股票/基金决策自动读取
+当日文件，候选/持仓自动挂预测，事件风险参与订单收紧。非交易日自动跳过；
+`--force` 手动试跑，`--no-predict` 跳过预测，`--focus "特朗普 关税"`
+增加聚焦检索。
+
+## Pi 部署 / Clash / 国外搜索
+
+Pi 通过 Tailscale 访问：`ssh orangepi@100.117.242.5`
+（主机名 `orangepizero2w-1`）。Clash 用 mihomo user service 常驻：
+
+```bash
+# Pi 本地文件（均不入库，chmod 600）
+~/.config/mihomo/config.yaml                 # Clash 订阅生成的配置
+~/.config/ai-quant/clash/subscription.txt    # 订阅 URL
+~/.config/ai-quant/foreign_search.env        # 国外搜索代理/引擎
+
+systemctl --user status mihomo
+python3 scripts/clash_update.py --check      # 连通性
+python3 scripts/clash_update.py              # 拉订阅 -> 校验 -> 重启
+# Pi cron: 每周一 06:00 自动刷新节点；失败保留旧配置
+python3 scripts/foreign_search.py --check    # Google/X/DDG
+python3 scripts/foreign_search.py -q "Trump tariff China" --count 5
+```
+
+X 的网页检索可能被登录/风控挡住；要稳定查 X，在
+`~/.config/ai-quant/foreign_search.env` 增加 `X_BEARER_TOKEN=...`
+（X API v2），不配则自动退回 `site:x.com` 网页检索。
+
+盘中/午休不再按固定点跑：**板块波动监控（事件驱动）**
+`agent/volatility_watch.py` + `scripts/volatility_watcher.py --loop`
+每分钟拉东财全行业板块指数快照，用量比/振幅/涨跌预筛，
+对可疑板块复核 ATRTR/ATR14、布林带宽(20,2) z 分数、量比
+（三者至少占二才算"波动大"，阈值在 `config/stock.yaml`
+`volatility_watch`）。触发即激活：刷新事件资料 + flock 锁下跑一轮
+`sim.run` 决策。静默超过 60 分钟或无信号也会强制激活一次，防失联。
+
+```bash
+systemctl --user status aiquant-watcher   # Pi 常驻服务
+python3 scripts/volatility_watcher.py --status    # 今日激活情况
+python3 scripts/volatility_watcher.py --once      # 手动单次检查
+python3 scripts/volatility_watcher.py --force     # 立即激活
+```
+
+仅 12:30 午休保留一条固定研究 cron（时段无行情，只补外部事件）；每日
+激活上限 `max_activations`（默认 8 次），两次激活至少间隔 15 分钟。
 
 ## 状态页（`/quant/`）
 
@@ -165,4 +259,10 @@ cd scripts/cli && python3 stock_predict.py 000725
 ## 约定
 
 - 密钥只放 `.env` 与主目录授权文件，不入库（`.env` 已在 .gitignore）
+- Clash 订阅、节点配置、代理地址只放
+  `~/.config/ai-quant/` / `~/.config/mihomo/`，仓库只保留
+  `config/foreign_search.example.env` 模板
+- 提交前自动检查：`git config core.hooksPath .githooks` 后，pre-commit 会
+  扫描 `DEEPSEEK_API_KEY`、`sk-*`、`MAIL_AUTH_CODE`、Clash 订阅与
+  `proxy-groups`；也可手动 `python3 scripts/check_secrets.py`
 - 历史备份不散落：统一移入 `archive/`；大文件（缓存、生成物）不入 git

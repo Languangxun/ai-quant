@@ -20,7 +20,7 @@ from agent.ensemble import EnsembleDecision, DeepSeekVoter, OllamaVoter
 from data.fund.fund_mapping import FUND_MAP
 from data.fund.fund_provider import EastMoneyPingZhongProvider
 from data.market.tencent_provider import TencentProvider
-from memory import otc_memory
+from memory import mail_feedback, otc_memory, premarket
 from scripts.usb_backup import backup as usb_backup
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -378,6 +378,16 @@ def main(argv=None):
     if context["stock_signals"]:
         print("  外部信号 %d 条已并入决策上下文"
               % len(context["stock_signals"]))
+
+    feedback = mail_feedback.load_for_decision()
+    if feedback:
+        context["user_feedback"] = feedback
+        print(f"  邮件反馈 {len(feedback['items'])} 条已并入决策上下文")
+
+    pre = premarket.load_for_decision(str(trade_date))
+    if pre:
+        context["premarket"] = pre
+        print(f"  盘前资料 {len(pre['items'])} 条已并入决策上下文")
 
     # 多模型决策
     voters = [DeepSeekVoter()]

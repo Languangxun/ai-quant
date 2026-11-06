@@ -6,9 +6,53 @@ models:
     display_name: DeepSeek-V4.1-Flash
     base_url: https://api.deepseek.com
 
+    # 决策期工具调用（借鉴桌面 GUI：get_market/get_prediction/get_kline/
+    # get_quote/get_external_env/search_news）。接口不支持 tools 时自动降级。
+    tools:
+      enabled: true
+      max_rounds: 3                # 最多几轮“调工具 -> 再回答”
+      max_calls: 8                 # 单次决策最多工具调用次数
+      predict_timeout: 45          # 单只 stock_predict 预测硬超时（秒）
+
   embedding:
     provider: ollama
     model: qwen3-embedding         # Ollama qwen3-embedding:0.6b
+
+  # DeepSeek 官方 Search API：决策前自动联网检索市场/个股新闻
+  # 计费 $0.75/千次（按成功请求），结果按 cache_ttl 缓存；失败静默降级
+  search:
+    enabled: true
+    endpoint: https://api.deepseek.com/v1/tools/search
+    count: 8                       # 每条查询返回条数（1-50；8 条便于去重排序）
+    max_queries: 2                 # 每次决策最多查询数（大盘 + 候选/持仓）
+    max_chars: 3600                # 并入上下文的摘要总字符上限
+    cache_ttl: 1800                # 秒；同一查询 30 分钟内复用
+    timeout: 10                    # 秒
+    need_content: false            # 只要摘要，不抓全文（省 token/降注入风险）
+
+    # 重大事件检索（特朗普/关税/地缘/美联储）：
+    # 中英文交叉查询 -> 去重 -> 按新鲜度/来源质量排序 -> 结构化信号。
+    # 结果同时进入 web_search 与 event_watch，盘前还会落盘供 10:00 决策复用。
+    event_watch:
+      enabled: true
+      topics: ["trump", "macro"]   # 可选 trump/fed/geopolitics/macro
+      days: 3                      # 近 N 天（突发用 2-3，复盘用 7）
+      max_queries: 3               # 中文事件 + 美国选举 + 英文原始报道
+      count: 8                     # 单条查询返回条数
+      max_items: 6                 # 排序后并入上下文的条数
+
+    # 国外搜索（独立程序 scripts/foreign_search.py，纯标准库）
+    # 走本机 Clash/mihomo（默认 http://127.0.0.1:7890），可查 Google/X/DDG。
+    # 代理地址和 Clash 订阅只放 Pi 本地 ~/.config/ai-quant/，绝不入库。
+    foreign:
+      enabled: true
+      engines: ["google-news", "bing", "duckduckgo"]  # Google News 最稳
+      count: 5
+      timeout: 8
+      days: 3
+      include_x: true              # 额外查 site:x.com（盘前更完整）
+      max_queries: 1               # 决策期只跑一条，控制延迟
+      proxy: ""                    # 空=读 FOREIGN_SEARCH_PROXY 或 127.0.0.1:7890
 
 ensemble:
 

@@ -15,6 +15,36 @@ stock:
     times: ["10:00", "11:00", "13:30", "14:45"]
     max_buys_per_day: 3       # 每日最多买入笔数（含加仓）
     once_per_code_per_day: true   # 同一只票当日不重复加仓
+    # 盘中/午休资料刷新：默认走 volatility_watch 事件驱动；
+    # 如需回退固定时间表（cron 调 scripts/intraday_research.py），
+    # 在此加回 research_times 即可
+
+  # 板块波动监控（事件驱动激活，替代固定时间表）
+  # scripts/volatility_watcher.py --loop 常驻；状态存 sim/state/
+  volatility_watch:
+    enabled: true
+    interval_sec: 60          # 板块快照间隔（东财 m:90+t:2 一次全量）
+    quiet_minutes: 60         # 静默超过 N 分钟强制激活一次
+    min_cooldown_min: 15      # 两次激活最小间隔
+    max_activations: 8        # 每日最多激活次数
+    # 波动定义：ATR / 布林带宽 / 量能 至少满足 min_signals 个
+    atr_ratio: 1.8            # 当日 TR / ATR14
+    bw_z: 2.0                 # 布林带宽(20,2) z 分数（近60日分布）
+    vol_ratio: 2.0            # 今日量 / MA5 量
+    min_signals: 2
+    # 快照预筛阈值（用于挑出需要复核的板块）
+    amp_pct: 2.2              # 日振幅%
+    pct_abs: 1.8              # 涨跌幅绝对值%
+    amount_ratio: 2.0         # 快照成交额 vs 自身近60快照均值
+    max_verify: 6             # 每周期最多复核几个板块
+    verify_ttl_sec: 300       # 同板块复核缓存
+
+  # 决策上下文附带五档挂单 + 集合竞价状态（借鉴 GUI 盘口面板）
+  orderbook:
+    enabled: true
+    max_codes: 6              # 候选前4 + 持仓，去重后最多 N 只
+    levels: 3                 # 每侧返回档数（1-5）
+    execution_pricing: true   # BUY 用卖一/SELL 用买一成交；无卖单不买、无买单不卖
 
   # 交易费用（A股）
   fees:
@@ -31,6 +61,16 @@ stock:
     atr_mult: 1.5
     trail_trigger: 1.02
     trail_ratio: 0.94
+
+  # 事件风险覆盖（特朗普/关税/地缘/美联储等；盘前 event_risk + LLM 修正）
+  # 只收紧 BUY，不干预 SELL；normal 或 offensive+elevated 时不动作。
+  event_risk:
+    enabled: true
+    elevated_max_position_pct: 15   # elevated：单票目标仓位上限
+    elevated_max_buys: 2            # elevated：单次决策最多新增买入笔数
+    high_max_position_pct: 10       # high：单票目标仓位上限
+    high_max_buys: 1                # high：单次决策最多新增买入笔数
+    block_hurt_sectors: true        # high 时跳过明确受损行业
 
   # 信号/选股（复用 CLI 多维评分 + RISK_PARAMS）
   risk_mode: 稳健             # 保守 / 稳健 / 激进

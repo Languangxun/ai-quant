@@ -20,7 +20,8 @@ class LLMRunner:
     def __init__(self, backtest=False):
 
         self.llm = LLMClient(
-            model="deepseek"
+            model="deepseek",
+            search=False,   # 回测禁用联网检索，避免未来信息泄漏
         )
 
         self.backtest = backtest
