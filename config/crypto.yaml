@@ -1,0 +1,101 @@
+# cquant · 加密市场双模型融合实验配置
+# 数据与模型目录默认指向桌面上的 sm701 / sm702，可按需覆盖。
+
+data:
+  db: /home/lan/桌面/sm701/stock_cache.db
+  table: crypto_daily
+  start: "2018-01-01"          # 特征预热起点（库内自 2017-08 起）
+  end: ""                      # 空 = 库内最新（当前 2026-11-03）
+  min_bars: 120                # 单币最少 K 线
+  quote: USDT
+  btc: BTCUSDT
+  exclude_codes: ["BTCUSDT"]   # 残差标签以 BTC 为基准，BTC 本身不做选币标的
+
+vendors:
+  sm701: /home/lan/桌面/sm701   # 40 维 tech 因子 + 横截面模型
+  sm702: /home/lan/桌面/sm702   # 120 维顶部因子 + 止损模型
+
+model:
+  source: walkforward          # walkforward=逐折重训；pretrained=调用 sm701/sm702 现成模型
+  test_years: [2022, 2023, 2024, 2025, 2026]
+  train_years: 4               # 每折训练窗口（年）
+  sample_start: "2018-06-01"
+  horizon: 10                  # 信号/收益周期（天，24/7 市场）
+  min_train: 15000
+  threads: 8
+  pretrained:
+    sm701_alpha: markets_output/crypto_ab_E13_h10.txt
+    sm702_risk: outputs_crypto/models/lgbm_{year}.txt
+    alpha_valid_from: "2024-01-01"   # 该模型训练截止 2023-12-31
+
+  alpha:                       # sm701 train_crypto_ab E1/E3 口径
+    learning_rate: 0.03
+    num_leaves: 31
+    min_data_in_leaf: 800
+    feature_fraction: 0.6
+    bagging_fraction: 0.7
+    bagging_freq: 1
+    lambda_l2: 20
+    n_estimators: 1500
+    early_stopping: 100
+
+  risk:                        # sm702 顶部模型口径
+    learning_rate: 0.03
+    num_leaves: 63
+    min_data_in_leaf: 300
+    feature_fraction: 0.75
+    bagging_fraction: 0.85
+    bagging_freq: 1
+    lambda_l2: 10
+    n_estimators: 600
+    early_stopping: 40
+    decay_halflife_years: 3
+    dd_threshold: 0.08
+    newhigh_threshold: 0.03
+
+fusion:
+  risk_penalty: 0.5            # 融合分 = z(alpha) - λ·z(risk)
+  risk_gate_prob: 0.45         # 多头硬门槛：顶部概率 >= 该值不买
+  risk_gate_quantile: 0.85     # 同时不超过当日截面 85% 分位（防概率分布漂移）
+  hysteresis: 6                # 已有持仓在排名前 n+buffer 内不换，降低换手
+  regime:                      # 截面风险中位数处于历史高分位 -> 降杠杆
+    enabled: true
+    lookback: 40               # 回看多少个调仓日
+    q_high: 0.80
+    scale_high: 0.7
+    q_extreme: 0.95
+    scale_extreme: 0.4
+
+portfolio:
+  hedge_mode: none             # none=纯多头杠杆；btc=多头 alpha + BTC beta 对冲；cross_section=截面多空
+  n_long: 12
+  n_short: 12
+  book_fraction: 0.25          # 每日最多取截面 25% 作为单边持仓数上限
+  leverage: 2.0                # 目标总敞口上限（gross / equity）
+  max_leverage: 3.0            # 硬上限：盘中/收盘超过会在下个开盘自动减仓
+  vol_target: 0.35             # 目标年化波动（0 = 不做波动缩放）
+  vol_upscale: false           # 只降不升，避免低波动期悄悄加杠杆
+  min_vol_scale: 0.25
+  signal_smooth_days: 3        # alpha/risk 逐币滚动平滑，降低排名噪声
+  rebalance_days: 10           # 与 horizon 对齐，降低换手
+  min_hist: 120
+  min_turnover_usdt: 3000000   # 20 日均成交额下限（USDT）
+  btc_code: BTCUSDT
+  max_weight: 0.25             # 单币名义敞口占权益上限（12 币时最高支持 3x gross）
+  fee_rate: 0.0005             # 单边手续费
+  slippage: 0.0005             # 单边滑点
+  funding_daily: 0.0001        # 逐日资金费
+  funding_mode: net            # net=多空对冲后按净敞口计（更贴近永续）；gross=保守全收
+  maintenance_rate: 0.01       # 维持保证金率
+  liq_fee: 0.005
+  liq_cooldown_days: 5
+  capital: 100000.0
+
+backtest:
+  start: "2022-01-01"
+  end: ""
+  ablations: true
+  leverage_sweep: [1.0, 1.5, 2.0, 3.0]
+
+output:
+  dir: outputs

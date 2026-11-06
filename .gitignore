@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+.env
+
+# pytest
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+wf_run.log
+wf_run2.log
+
+# Outputs / data
+outputs/
+*.json
+*.csv
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# 其他
+.freebuff/
