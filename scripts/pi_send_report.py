@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """pi 邮件汇报。用法:
-  python3 send_report.py               # 发今日复盘 + sim.log 尾部 (去重: 当日已发则跳过)
+  python3 send_report.py               # 今日复盘 + 港股/美股/加密 + sim.log 尾部
   python3 send_report.py daily-force   # 强制重发今日复盘
+  python3 send_report.py multi         # 只发多市场日报（可放 19:15 cron 取当日数据）
   python3 send_report.py replay-final  # 发训练回放最终报告
   python3 send_report.py setup-fail "<msg>"   # 部署失败告警
   python3 send_report.py setup-ok "<msg>"     # 部署完成通知
@@ -10,6 +11,8 @@
 socket.gaierror。这里做 5 次退避重试, 仍失败则用公共 DNS 直查 A 记录
 把 smtp 主机钉到 IP (SNI/证书仍用域名) 后再发。
 """
+import glob
+import json
 import os
 import random
 import socket
@@ -210,6 +213,126 @@ def _review_paths(d):
             os.path.expanduser(f"~/ai-quant/memory/daily/复盘-{d}.md")]
 
 
+MULTI_MARKETS = [
+    ("hk", "港股", "HKD"),
+    ("us", "美股", "USD"),
+    ("crypto", "加密", "USDT"),
+]
+
+
+def _load_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _latest_multi_daily(base, market):
+    pats = sorted(glob.glob(os.path.join(
+        base, "memory", "daily", f"multi-{market}-*.json")))
+    for path in reversed(pats):
+        doc = _load_json(path)
+        if isinstance(doc, dict):
+            return doc
+    return None
+
+
+def _fmt_num(value, digits=2):
+    try:
+        return f"{float(value):,.{digits}f}"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _state_account(state):
+    """无当日快照时，用最新价从状态文件算一份账户快照。"""
+    cash = float(state.get("cash") or 0)
+    prices = state.get("last_prices") or {}
+    positions, mv = {}, 0.0
+    for code, lots in (state.get("lots") or {}).items():
+        shares = sum(float(l.get("shares") or 0) for l in lots)
+        if shares <= 1e-12:
+            continue
+        cost = (sum(float(l.get("cost") or 0) * float(l.get("shares") or 0)
+                    for l in lots) / shares)
+        px = float(prices.get(code) or 0)
+        mv += shares * px
+        positions[code] = {
+            "shares": shares, "cost": cost, "price": px,
+            "pnl_pct": (px / cost - 1) * 100 if cost else 0.0,
+        }
+    total = cash + mv
+    for p in positions.values():
+        p["pct"] = (p["shares"] * p["price"] / total * 100) if total else 0.0
+    return {"cash": cash, "total_asset": total,
+            "positions": positions,
+            "realized_pnl": state.get("realized_pnl", 0),
+            "trade_count": state.get("trade_count", 0)}
+
+
+def multi_market_report(base="~/ai-quant"):
+    """港股/美股/加密 最新每日快照（数据日 + 资产 + 持仓 + 信号 + 成交）。"""
+    base = os.path.expanduser(base)
+    today = date.today().isoformat()
+    lines = []
+    for market, label, unit in MULTI_MARKETS:
+        state = _load_json(os.path.join(
+            base, "sim", "state", f"multi-{market}.json"))
+        daily = _latest_multi_daily(base, market)
+        if not state and not daily:
+            continue
+        acc = (daily or {}).get("account") or {}
+        if not acc and state:
+            acc = _state_account(state)
+        data_date = str((daily or {}).get("date") or "")
+        if data_date == today:
+            when = "今日"
+        elif data_date:
+            when = f"最新 {data_date}"
+        else:
+            when = "暂无快照"
+        total = acc.get("total_asset")
+        lines.append(
+            f"[{label}] {when} | 总资产 {_fmt_num(total)} {unit} | "
+            f"现金 {_fmt_num(acc.get('cash'))} {unit}")
+        cap = float(state.get("initial_capital") or 0) if state else 0.0
+        if cap:
+            pnl = float(total or 0) - cap
+            lines.append(
+                f"  本金 {_fmt_num(cap)} | 盈亏 {pnl:+,.2f} "
+                f"({pnl / cap * 100:+.2f}%)")
+        positions = acc.get("positions") or {}
+        if positions:
+            lines.append("  持仓: " + "；".join(
+                f"{code} {_fmt_num(p.get('pct'), 2)}% "
+                f"成本{_fmt_num(p.get('cost'), 4)} "
+                f"现价{_fmt_num(p.get('price'), 4)} "
+                f"({_fmt_num(p.get('pnl_pct'), 2)}%)"
+                for code, p in positions.items()))
+        else:
+            lines.append("  持仓: 无")
+        signals = (daily or {}).get("signals") or []
+        if signals:
+            lines.append("  信号: " + ", ".join(
+                f"{s.get('code')} {_fmt_num(s.get('score'), 1)}"
+                for s in signals[:5]))
+        trades = (daily or {}).get("trades") or []
+        if trades:
+            lines.append(f"  成交 {len(trades)} 笔: " + "；".join(
+                f"{t.get('side')} {t.get('code')} "
+                f"{_fmt_num(t.get('price'), 4)}×"
+                f"{_fmt_num(t.get('shares'), 4)}"
+                for t in trades))
+        else:
+            lines.append("  成交: 无交易" if data_date else "  成交: 暂无")
+        lines.append("")
+    if not lines:
+        return ""
+    return ("--- 多市场（港股/美股/加密）---\n"
+            + "\n".join(lines).rstrip())
+
+
 def _sim_running():
     try:
         out = subprocess.run(["pgrep", "-f", "sim.run"],
@@ -272,6 +395,13 @@ def main():
         ok = send("ai-quant 双模型投票演示", body)
         return 0 if ok else 1
     d = date.today().isoformat()
+    if mode == "multi":
+        body = multi_market_report()
+        if not body:
+            body = "（暂无多市场快照，可能尚未运行）"
+        ok = send(f"ai-quant 多市场日报 {d}", body,
+                  dedupe_key=f"multi_{d}")
+        return 0 if ok else 1
     force = mode == "daily-force"
     path = wait_for_review(d) if not force else next(
         (x for x in _review_paths(d) if os.path.exists(x)), None)
@@ -280,6 +410,9 @@ def main():
             body = f.read()
     else:
         body = f"（今日复盘文件不存在：{d}，可能未运行或失败）"
+    multi = multi_market_report()
+    if multi:
+        body += "\n\n" + multi
     simlog = os.path.expanduser("~/ai-quant/logs/sim.log")
     if os.path.exists(simlog):
         with open(simlog, encoding="utf-8", errors="ignore") as f:

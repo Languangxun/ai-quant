@@ -5,13 +5,13 @@ from models.deepseek import DeepSeekModel
 
 class LLMClient:
 
-    def __init__(self, model="deepseek"):
+    def __init__(self, model="deepseek", search=None):
 
         self.model = model
 
 
         if self.model == "deepseek":
-            self.client = DeepSeekModel()
+            self.client = DeepSeekModel(search_client=search)
 
 
     def analyze(self, context):

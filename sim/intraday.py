@@ -81,6 +81,15 @@ def render_review(date_str, summary):
         lines.append(f"### {s.get('time', '?')}")
         if s.get("market_view"):
             lines.append(f"- 观点：{s['market_view']}")
+        risk = s.get("event_risk") or {}
+        if risk:
+            lines.append(
+                f"- 事件风险：{risk.get('level', 'normal')}"
+                f"/{risk.get('posture', 'neutral')} "
+                f"score={risk.get('risk_score', 0)} "
+                f"{risk.get('summary', '')}")
+        for note in s.get("overlay_notes") or []:
+            lines.append(f"- 事件风控：{note}")
         for o in s.get("orders") or []:
             pos = o.get("position")
             pos_txt = f" 仓位{pos}%" if pos is not None else ""

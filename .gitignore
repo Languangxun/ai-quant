@@ -4,12 +4,22 @@ __pycache__/
 memory/*.json
 logs/
 .env
+# 本地密钥/代理/Clash 订阅（绝不入库；模板用 *.example.env）
+config/*.env
+!config/*.example.env
+clash/
+mihomo/
+subscription*
+*.sub
+*.yaml.bak
+*.clash.yaml
 backtest/results/
 sim/state/
 memory/daily/
 
 # 归档（历史备份，不入库）
 archive/
+.deploy_backup/
 
 # 收件箱：运行时数据（推送的报告 JSON）
 memory/inbox/
@@ -24,3 +34,4 @@ data/global_daily.db*
 
 # sm701 分市场 production 模型 (约100MB, 从桌面拷贝, 不入库)
 vendors/sm701/production/
+头像.jpg

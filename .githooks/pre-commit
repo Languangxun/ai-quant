@@ -1,0 +1,3 @@
+#!/bin/sh
+# 阻止 KEY / Clash 订阅 / 节点配置进入提交
+exec python3 scripts/check_secrets.py --staged
