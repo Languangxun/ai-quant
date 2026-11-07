@@ -136,9 +136,11 @@ DOWNLOAD_WHITELIST = {
 
 
 def resolve_download_path(rel):
-    """只允许下载白名单目录下的文件，防止目录遍历。"""
+    """只允许下载白名单目录下的文件，防止目录遍历；黑名单命中返回 None。"""
     rel = rel.lstrip("/")
     if not rel or ".." in rel.split("/"):
+        return None
+    if rel in DOWNLOAD_BLOCKLIST:
         return None
     for prefix, base in DOWNLOAD_WHITELIST.items():
         if rel.startswith(prefix + "/"):
@@ -216,11 +218,20 @@ DOWNLOAD_RESOURCES = {
         ("data/features/technical.py", "data/features 技术指标入口"),
     ],
     "配置": [
-        ("config/model.yaml", "模型配置 (LLM/embedding/search)"),
         ("config/markets.yaml", "多市场配置 (fund/hk/us/crypto/fut)"),
-        ("config/system.yaml", "系统配置"),
         ("config/stock.yaml", "A股策略配置"),
     ],
+}
+
+# 下载黑名单：含明文授权码/密钥的文件禁止下载（防止密钥外泄）。
+# 若变量来自环境文件/密钥库，恢复下载前先完成脱敏。
+DOWNLOAD_BLOCKLIST = {
+    "scripts/quant_status_mail.py",   # 内含 SMTP 授权码明文
+    "scripts/quant_status_web.py",    # 主服务脚本（源码不在下载范围）
+    "scripts/check_secrets.py",       # 密钥检查工具（描述敏感文件路径）
+    ".env", ".env.local", "config/model.yaml",
+    "scripts/daily_status.sh", "scripts/daily_stock.sh",  # 含环境加载
+    "scripts/sync_global_daily.py",   # 数据口径工具（内部）
 }
 
 
@@ -400,6 +411,8 @@ def download_page():
         rows = []
         for rel, desc in items:
             full = resolve_download_path(rel)
+            if not full:
+                continue  # 黑名单命中（含密钥）不列出
             size = fmt_size(os.path.getsize(full)) if full else "不可用"
             rows.append(
                 f"<tr><td><strong>{os.path.basename(rel)}</strong></td>"

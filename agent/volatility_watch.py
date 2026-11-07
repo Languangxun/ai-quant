@@ -34,7 +34,8 @@ SESSION_WINDOWS = ((dtime(9, 25), dtime(11, 31)),
 
 DEFAULT_CONFIG = {
     "enabled": True,
-    "interval_sec": 60,          # 快照间隔（秒）
+    "interval_sec": 20,          # 快照间隔（秒）。行业板块快照一次请求全量~90个，
+                                 # 20s 轮询 = 3 req/min，异动即可分钟级触发
     "quiet_minutes": 60,         # 静默超过 N 分钟强制激活一次
     "min_cooldown_min": 15,      # 两次激活最小间隔（分钟）
     "max_activations": 8,        # 每日最多激活次数
@@ -53,13 +54,38 @@ DEFAULT_CONFIG = {
 STATE_PATH = os.path.join(BASE_DIR, "sim", "state",
                           "volatility_watch.json")
 
+# 日K复核缓存（code -> (ts, 指标, 命中数)），跨周期持久，cap 上限防爆
+_VERIFY_CACHE = {}
+_VERIFY_CACHE_MAX = 256
+
 
 # ---------------------------------------------------------------- 数据抓取
+def _em_openers():
+    """东财请求 opener 链。环境变量 EM_PROXY 配置专用出口（如
+    http://100.117.242.5:8899，经 tailnet 内 Orange Pi 隧道），
+    因为部分出口 IP 会被东财行情接口 WAF 拒绝；未配置则直连。"""
+    proxy = (os.environ.get("EM_PROXY") or "").strip()
+    opener = None
+    if proxy:
+        try:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        except Exception:
+            opener = None
+    return ([opener] if opener else []) + [urllib.request.build_opener()]
+
+
 def _get(url, timeout=6.0):
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read(2_000_000)
-    return json.loads(raw.decode("utf-8", "replace"))
+    last = None
+    for opener in _em_openers():
+        try:
+            with opener.open(req, timeout=timeout) as r:
+                raw = r.read(2_000_000)
+            return json.loads(raw.decode("utf-8", "replace"))
+        except Exception as e:
+            last = e
+    raise last
 
 
 def _f(v):
@@ -202,8 +228,9 @@ def save_state(state, path=STATE_PATH):
     os.replace(tmp, path)
 
 
-def update_history(state, snapshot, ts=None, keep=120):
-    """把本周期快照滚动并入 per-板块历史（成交额序列用于量能突增预筛）。"""
+def update_history(state, snapshot, ts=None, keep=240):
+    """把本周期快照滚动并入 per-板块历史（成交额序列用于量能突增预筛）。
+    默认保留 240 个快照（interval=20s 时约 80 分钟窗口）。"""
     ts = ts or time.strftime("%H:%M:%S")
     hist = state.setdefault("hist", {})
     for row in snapshot:
@@ -255,10 +282,16 @@ def prefilter(state, snapshot, cfg):
 
 
 def verify_daily(code, cfg, cache=None):
-    """拉日K复核 ATR / 布林带宽 / 量能，返回 (指标dict, 命中数)。"""
+    """拉日K复核 ATR / 布林带宽 / 量能，返回 (指标dict, 命中数)。
+    cache 为空时使用模块级持久缓存（跨周期复用，按 verify_ttl_sec 过期）。"""
     now = time.time()
     if not isinstance(cache, dict):
-        cache = {}
+        cache = _VERIFY_CACHE
+    if len(cache) > _VERIFY_CACHE_MAX:
+        cutoff = now - float(cfg.get("verify_ttl_sec", 300))
+        stale = [k for k, v in cache.items() if v[0] < cutoff]
+        for k in stale:
+            del cache[k]
     cached = cache.get(code)
     if cached and now - cached[0] < cfg.get("verify_ttl_sec", 300):
         return cached[1], cached[2]
@@ -293,11 +326,16 @@ def check(state, cfg=None, do_fetch=True, snapshot=None, verify_cache=None):
      force, snapshot_size}
 
     action=activate 时调用方应激活（研究+决策）。静默超时 /
-    首次进入会话 / 冷却结束后的强制逻辑也在这里给出。"""
+    首次进入会话 / 冷却结束后的强制逻辑也在这里给出。
+    verify_cache 缺省用模块级持久缓存（跨周期复用复核结果，
+    避免 20s 快照间隔下每轮重复拉日K）。"""
     cfg = {**DEFAULT_CONFIG, **(cfg or {})}
     today = time.strftime("%Y-%m-%d")
     if state.get("day") != today:
-        state.update(day=today, activated=0, last_ts="", hist={})
+        # 新交易日：跨日清理（会话起点一并重置，修复开盘立刻
+        # "静默超时强制激活" 的误触发）
+        state.update(day=today, activated=0, last_ts="", hist={},
+                     session_started_at=0)
     if not cfg.get("enabled", True):
         return {"action": "skip", "reason": "disabled"}
 

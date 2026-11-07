@@ -23,7 +23,7 @@ stock:
   # scripts/volatility_watcher.py --loop 常驻；状态存 sim/state/
   volatility_watch:
     enabled: true
-    interval_sec: 60          # 板块快照间隔（东财 m:90+t:2 一次全量）
+    interval_sec: 20          # 板块快照间隔（东财 m:90+t:2 一次全量，20s≈3req/min）
     quiet_minutes: 60         # 静默超过 N 分钟强制激活一次
     min_cooldown_min: 15      # 两次激活最小间隔
     max_activations: 8        # 每日最多激活次数
