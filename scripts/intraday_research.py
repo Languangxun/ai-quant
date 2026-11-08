@@ -36,6 +36,8 @@ MAX_ITEMS = 15
 
 def _baseline(client, date_str, days, count):
     """A股盘中/板块补充；失败返回 []。"""
+    if client is None:
+        return []
     queries = [
         "A股 盘中 异动 板块 资金 最新",
         "A股 午后 行情 主线 最新",
@@ -68,12 +70,21 @@ def run(force=False, days=2, count=6, focus="", use_foreign=True,
 
     client = build_from_config()
     if client is None:
-        print("[intraday] 未启用 DeepSeek Search（config/model.yaml）",
+        print("[intraday] DeepSeek Search 未启用（已改必应），仅跑外网检索",
               flush=True)
-        return 1
     date_str = today.isoformat()
     label = time.strftime("%H%M")
-    fcfg = dict(getattr(client, "foreign", {}) or {})
+    if client is not None:
+        fcfg = dict(getattr(client, "foreign", {}) or {})
+    else:
+        try:
+            from models.config import load_model_config
+            _s = (load_model_config().get("models") or {}).get("search") or {}
+            fcfg = dict(_s.get("foreign") or {})
+        except Exception:
+            fcfg = {"enabled": True,
+                    "engines": ["bing", "wsj", "investing"],
+                    "count": 8, "days": days, "include_x": True}
     if not use_foreign:
         fcfg["enabled"] = False
     else:
