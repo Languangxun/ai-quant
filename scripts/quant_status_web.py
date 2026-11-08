@@ -128,7 +128,6 @@ DOWNLOAD_WHITELIST = {
     "scripts": os.path.join(BASE_DIR, "scripts"),
     "scripts_cli": os.path.join(BASE_DIR, "scripts", "cli"),
     "database": os.path.join(BASE_DIR, "database"),
-    "factors": os.path.join(BASE_DIR, "factors"),
     "config": os.path.join(BASE_DIR, "config"),
     "backtest": os.path.join(BASE_DIR, "backtest"),
     "docs": os.path.join(BASE_DIR, "docs"),
@@ -209,14 +208,6 @@ DOWNLOAD_RESOURCES = {
         ("scripts/daily_status.sh", "每日状态邮件 + 模拟盘任务脚本"),
         ("scripts/daily_stock.sh", "A股交易日自动跑盘脚本"),
     ],
-    "指标/因子代码": [
-        ("factors/technical.py", "技术指标因子 (MA/RSI/MACD/布林带等)"),
-        ("factors/morphology.py", "形态因子"),
-        ("factors/sm701.py", "sm701 LightGBM/TCN 选股因子"),
-        ("factors/ml.py", "机器学习特征工程"),
-        ("factors/chaodi.py", "抄底因子"),
-        ("data/features/technical.py", "data/features 技术指标入口"),
-    ],
     "配置": [
         ("config/markets.yaml", "多市场配置 (fund/hk/us/crypto/fut)"),
         ("config/stock.yaml", "A股策略配置"),
@@ -226,6 +217,13 @@ DOWNLOAD_RESOURCES = {
 # 下载黑名单：含明文授权码/密钥的文件禁止下载（防止密钥外泄）。
 # 若变量来自环境文件/密钥库，恢复下载前先完成脱敏。
 DOWNLOAD_BLOCKLIST = {
+    "factors/technical.py",           # 用户指令：因子全下架
+    "factors/morphology.py",
+    "factors/sm701.py",
+    "factors/ml.py",
+    "factors/chaodi.py",
+    "factors/__init__.py",
+    "data/features/technical.py",
     "scripts/quant_status_mail.py",   # 内含 SMTP 授权码明文
     "scripts/quant_status_web.py",    # 主服务脚本（源码不在下载范围）
     "scripts/check_secrets.py",       # 密钥检查工具（描述敏感文件路径）
