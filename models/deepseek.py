@@ -161,14 +161,15 @@ class DeepSeekModel(BaseModel):
         _base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.context_dir = context_dir or os.path.join(_base, "sim", "state")
 
-        api_key = os.getenv(
-            "DEEPSEEK_API_KEY"
+        api_key = (
+            os.getenv("OPENCODE_GO_API_KEY")
+            or os.getenv("DEEPSEEK_API_KEY")
         )
 
         if not api_key:
 
             raise ValueError(
-                "DEEPSEEK_API_KEY 未配置"
+                "OPENCODE_GO_API_KEY 或 DEEPSEEK_API_KEY 未配置"
             )
 
         self.client = OpenAI(
@@ -181,6 +182,12 @@ class DeepSeekModel(BaseModel):
 
             max_retries=API_MAX_RETRIES,
 
+            default_headers={
+                "x-opencode-session": os.getenv(
+                    "OPENCODE_SESSION", "quant-aiquant"
+                )
+            },
+
         )
 
         # 自动联网检索：DeepSeek Search API（失败静默降级，不影响决策）
@@ -189,8 +196,9 @@ class DeepSeekModel(BaseModel):
         elif search_client is not None:
             self.search_client = search_client
         else:
+            # 搜索走 DeepSeek 官方 key（与 OpenCode Go 决策 key 解耦）
             self.search_client = build_from_config(
-                config, api_key=api_key)
+                config, api_key=os.getenv("DEEPSEEK_API_KEY") or api_key)
 
     def _augment(self, context):
         """决策前自动检索并把摘要并入上下文；任何异常都保持原样。"""

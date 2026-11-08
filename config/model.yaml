@@ -2,9 +2,9 @@ models:
 
   decision:
     provider: deepseek
-    model: deepseek-flash          # DeepSeek-V4.1-Flash（api.deepseek.com 模型ID）
-    display_name: DeepSeek-V4.1-Flash
-    base_url: https://api.deepseek.com
+    model: deepseek-v4.1-flash     # OpenCode Go 平台模型 ID
+    display_name: DeepSeek-V4.1-Flash (OpenCode Go)
+    base_url: https://opencode.ai/inference/go/openai/v1
 
     # 决策期工具调用（借鉴桌面 GUI：get_market/get_prediction/get_kline/
     # get_quote/get_external_env/search_news）。接口不支持 tools 时自动降级。
