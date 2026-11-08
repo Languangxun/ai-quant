@@ -1201,6 +1201,18 @@ pre {{ background: var(--bg); padding: 12px; border-radius: 6px; overflow-x: aut
 <div class="container">
 {content}
 </div>
+<footer style="border-top:1px solid var(--border);margin-top:28px;padding:18px 24px;text-align:center;color:var(--muted);font-size:12px">
+  <div style="display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap">
+    <img src="/web_assets/logo.png" alt="stock-analyzer"
+         style="height:44px;border-radius:6px;display:inline-block"
+         onerror="this.style.display='none'"/>
+    <span style="font-size:13px;color:var(--text)">stock-analyzer</span>
+    <span style="opacity:.55">·</span>
+    <span>Powered by 獨白量化</span>
+    <span style="opacity:.55">·</span>
+    <span><a href="https://github.com/Languangxun/ai-quant" style="color:var(--accent);text-decoration:none" target="_blank"># ai-quant</a></span>
+  </div>
+</footer>
 </body>
 </html>"""
 
@@ -1858,6 +1870,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_response(403)
                     self.end_headers()
                     self.wfile.write(b"forbidden or not found")
+            elif path == "/web_assets/logo.png":
+                logo = os.path.join(BASE_DIR, "scripts", "web_assets", "logo.png")
+                if os.path.exists(logo):
+                    send_file_with_range(self, logo)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
             elif path == "/health":
                 self._json({"status": "ok"})
             else:
