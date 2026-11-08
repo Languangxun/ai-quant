@@ -203,7 +203,6 @@ DOWNLOAD_RESOURCES = {
     "数据工具": [
         ("scripts/sync_global_daily.py", "全球市场增量同步工具 (HK/US/CRYPTO/FUT)"),
         ("scripts/build_global_daily.py", "全球市场全量建库工具"),
-        ("scripts/cli/stock_predict.py", "stock-analyzer / 桌面 predict 核心：形态匹配 + 回测 + 数据清洗/回填"),
         ("scripts/daily_data_sync.py", "每日自动补全数据脚本（全球 + A股 watchlist）"),
         ("scripts/daily_status.sh", "每日状态邮件 + 模拟盘任务脚本"),
         ("scripts/daily_stock.sh", "A股交易日自动跑盘脚本"),
@@ -224,6 +223,8 @@ DOWNLOAD_BLOCKLIST = {
     "factors/chaodi.py",
     "factors/__init__.py",
     "data/features/technical.py",
+    "scripts/cli/stock_predict.py",   # 含 sm701/因子完整实现，停止下载
+    "scripts/cli/stock_predict.py.*",
     "scripts/quant_status_mail.py",   # 内含 SMTP 授权码明文
     "scripts/quant_status_web.py",    # 主服务脚本（源码不在下载范围）
     "scripts/check_secrets.py",       # 密钥检查工具（描述敏感文件路径）
