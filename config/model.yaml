@@ -18,10 +18,10 @@ models:
     provider: ollama
     model: qwen3-embedding         # Ollama qwen3-embedding:0.6b
 
-  # DeepSeek 官方 Search API：决策前自动联网检索市场/个股新闻
-  # 计费 $0.75/千次（按成功请求），结果按 cache_ttl 缓存；失败静默降级
+  # 搜索：DeepSeek 官方 Search 已停用（中文结果官号太多，改用必应）
+  # 决策前改为 LLM 自写查询词 → 必应/WSJ/Investing RSS 外网检索
   search:
-    enabled: true
+    enabled: false
     endpoint: https://api.deepseek.com/v1/tools/search
     count: 8                       # 每条查询返回条数（1-50；8 条便于去重排序）
     max_queries: 2                 # 每次决策最多查询数（大盘 + 候选/持仓）
@@ -46,8 +46,9 @@ models:
     # 代理地址和 Clash 订阅只放 Pi 本地 ~/.config/ai-quant/，绝不入库。
     foreign:
       enabled: true
-      engines: ["google-news", "bing", "duckduckgo", "wsj", "investing"]
-      # wsj=华尔街日报 RSS；investing=Investing.com RSS（英文财经主源）
+      engines: ["bing", "wsj", "investing", "google-news", "duckduckgo"]
+      # bing 主搜索（中英文均可用）；wsj/investing 英文财经 RSS
+      llm_queries: 3             # LLM 自写搜索词条数（决策前）
       count: 5
       timeout: 8
       days: 3

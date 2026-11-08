@@ -190,6 +190,10 @@ class DeepSeekModel(BaseModel):
 
         )
 
+        # 外网搜索配置（LLM 自写查询词 → Bing/WSJ/Investing）
+        _scfg = (config.get("models") or {}).get("search") or {}
+        self.foreign_cfg = dict(_scfg.get("foreign") or {})
+
         # 自动联网检索：DeepSeek Search API（失败静默降级，不影响决策）
         if search_client is False:
             self.search_client = None
@@ -200,10 +204,103 @@ class DeepSeekModel(BaseModel):
             self.search_client = build_from_config(
                 config, api_key=os.getenv("DEEPSEEK_API_KEY") or api_key)
 
+    def _llm_search_queries(self, context):
+        """让模型自己写搜索查询词（默认 3 条，中英混合）。失败返回 []。"""
+        try:
+            ctx = context if isinstance(context, dict) else {}
+            date_str = str(ctx.get("date") or time.strftime("%Y-%m-%d"))
+            cands = []
+            for c in (ctx.get("candidates") or [])[:8]:
+                if isinstance(c, dict):
+                    cands.append(str(c.get("name") or c.get("code") or ""))
+            positions = []
+            for p in (ctx.get("positions") or [])[:5]:
+                if isinstance(p, dict):
+                    positions.append(str(p.get("name") or p.get("code") or ""))
+            risk = ctx.get("event_risk") or {}
+            macro = str(risk.get("summary") or "")[:120]
+            n = int(self.foreign_cfg.get("llm_queries") or 3)
+            prompt = (
+                f"你在为 A 股量化决策做盘前/盘中资料检索。日期 {date_str}。\n"
+                f"候选股：{'、'.join(cands) or '无'}\n"
+                f"持仓：{'、'.join(positions) or '无'}\n"
+                f"宏观/事件：{macro or '无'}\n"
+                f"请写出 {n} 条最值得联网搜索的查询词：中英文各半、简短、"
+                "不带引号、不加编号，每行一条。只输出查询词本身。")
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=160, temperature=0.3)
+            text = (resp.choices[0].message.content or "").strip()
+            out = []
+            for line in text.splitlines():
+                q = re.sub(r"^[\s\-\*\d\.、\)]+", "", line).strip()
+                q = q.strip("\"'”“ ")
+                if 2 <= len(q) <= 80 and q not in out:
+                    out.append(q)
+                if len(out) >= n:
+                    break
+            return out
+        except Exception as e:
+            print(f"[search] LLM 写搜索词失败: {e}", flush=True)
+            return []
+
+    def _foreign_augment(self, context):
+        """无 DeepSeek Search 时：LLM 自写查询词 → Bing/WSJ/Investing 检索。"""
+        if not isinstance(context, dict):
+            return context, 0
+        if not self.foreign_cfg.get("enabled", True):
+            return context, 0
+        try:
+            from scripts import foreign_search
+        except Exception:
+            return context, 0
+        queries = self._llm_search_queries(context)
+        if not queries:
+            try:
+                from models.web_search import build_queries
+                queries = build_queries(context, 3)
+            except Exception:
+                queries = []
+        if not queries:
+            return context, 0
+        engines = [e for e in (self.foreign_cfg.get("engines")
+                               or ["bing", "wsj", "investing"]) if e]
+        try:
+            count = max(1, min(20, int(self.foreign_cfg.get("count") or 5)))
+            days = max(1, min(30, int(self.foreign_cfg.get("days") or 3)))
+        except (TypeError, ValueError):
+            count, days = 5, 3
+        rows, seen = [], set()
+        for q in queries:
+            try:
+                got = foreign_search.search(q, engines=engines,
+                                            count=count, days=days)
+            except Exception:
+                got = []
+            for r in got:
+                ident = r.get("url") or r.get("title")
+                if not ident or ident in seen:
+                    continue
+                seen.add(ident)
+                rows.append(r)
+        rows.sort(key=lambda r: str(r.get("date") or ""), reverse=True)
+        if not rows:
+            return context, 0
+        enriched = dict(context)
+        enriched["web_search"] = {"note": SEARCH_NOTE,
+                                  "results": rows[:12],
+                                  "llm_queries": queries}
+        print(f"[search] LLM 写词 {len(queries)} 条 → 外网检索 "
+              f"{len(rows)} 条（engines: {','.join(engines)}）", flush=True)
+        return enriched, len(rows)
+
     def _augment(self, context):
         """决策前自动检索并把摘要并入上下文；任何异常都保持原样。"""
-        if not self.search_client or not isinstance(context, dict):
+        if not isinstance(context, dict):
             return context, 0
+        if not self.search_client:
+            return self._foreign_augment(context)
         try:
             results = self.search_client.gather(context)
         except Exception as e:

@@ -49,6 +49,8 @@ def _query(keywords, days):
 
 
 def _collect(client, queries, days, count):
+    if client is None:
+        return []
     seen, items = set(), []
     for keywords in queries:
         query = _query(keywords, days)
