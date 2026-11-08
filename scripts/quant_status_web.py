@@ -1303,6 +1303,108 @@ def index_page():
     return base_page("Quant 行情看板", content, active="/")
 
 
+# ============== Pi 节点精华（OrangePi 状态聚合，网站 /quant 嵌入） ==============
+
+PI_STATUS_URL = (os.environ.get("PI_STATUS_URL")
+                 or "http://100.117.242.5:8188/pi_status.json")
+_pi_cache = {"ts": 0.0, "data": None}
+
+
+def pi_status_snapshot(refresh=False):
+    """拉取 Pi 节点精华 JSON（60 秒 TTL）；失败返回 error dict。"""
+    now = time.time()
+    if not refresh and _pi_cache["data"] and now - _pi_cache["ts"] < 60:
+        return _pi_cache["data"]
+    try:
+        import urllib.request as _u
+        req = _u.Request(PI_STATUS_URL, headers={"User-Agent": "quant-web"})
+        with _u.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        _pi_cache["data"], _pi_cache["ts"] = data, now
+        return data
+    except Exception as e:
+        data = {"unreachable": True, "error": str(e)[:120],
+                "url": PI_STATUS_URL}
+        _pi_cache["data"], _pi_cache["ts"] = data, now
+        return data
+
+
+PI_HOST_TITLE = "Pi OrangepiZero2W 节点"
+
+
+def _esc(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def pi_status_html(snap=None):
+    """渲染 Pi 精华为 HTML 卡片（嵌入网站 /quant 页）。"""
+    s = snap if snap is not None else pi_status_snapshot()
+    if s.get("unreachable"):
+        return ("<div class='card'><h2>" + PI_HOST_TITLE + "</h2>"
+                + "<p>未联通: " + _esc(s.get("error")) + "</p>"
+                + "<div class='meta'>url: " + _esc(s.get("url", "")) + "</div></div>")
+    m = s.get("machine") or {}
+    mrows = "".join("<tr><td><strong>" + _esc(k) + "</strong></td><td>"
+                    + _esc(v) + "</td></tr>" for k, v in m.items()
+                    if k not in ("Tailscale IP", "公网地址"))
+    srv = s.get("services") or {}
+    badges = " ".join(
+        "<span class='badge " + ("ok" if v == "active" else "warn")
+        + "'>" + _esc(k) + ": " + _esc(v) + "</span>" for k, v in srv.items())
+    ac_html = ""
+    for name in ("fund", "hk", "us", "crypto", "fut"):
+        a = s.get("accounts", {}).get(name) or {}
+        if not isinstance(a, dict) or not (a.get("总资产") or a.get("交易数")):
+            ac_html += ("<div class='card'><h3>" + name.upper()
+                        + " 模拟盘</h3><p>无状态</p></div>")
+            continue
+        ret = a.get("收益")
+        ret_txt = ("%+.2f%%" % (ret * 100)) if isinstance(ret, (int, float)) else "-"
+        body = ("<p><strong>总资产:</strong> " + _esc(a.get("总资产", "-"))
+                + " | <strong>现金:</strong> " + _esc(a.get("现金", "-"))
+                + " | <strong>收益:</strong> " + ret_txt
+                + " | <strong>交易:</strong> " + _esc(a.get("交易数", 0))
+                + "</p>")
+        rows = "".join(
+            "<tr><td>" + _esc(l.get("code")) + "</td><td>"
+            + _esc(l.get("shares")) + "</td><td>" + _esc(l.get("cost"))
+            + "</td><td>" + _esc(l.get("pnl_pct")) + "</td></tr>"
+            for l in (a.get("持仓") or [])[:4])
+        if rows:
+            body += ("<table style='font-size:12px'><tr><th>代码</th>"
+                     "<th>份额</th><th>成本</th><th>盈亏%</th></tr>"
+                     + rows + "</table>")
+        ac_html += ("<div class='card'><h3>" + name.upper()
+                    + " 模拟盘</h3>" + body + "</div>")
+    counts = ((s.get("market_counts") or {}).get("detail") or {})
+    crows = "".join(
+        "<tr><td>" + _esc(k) + "</td><td>" + _esc(v.get("rows"))
+        + "</td><td>" + _esc(v.get("codes")) + "</td><td>"
+        + _esc(v.get("max_date")) + "</td></tr>" for k, v in counts.items())
+    c_html = (("<table><tr><th>市场</th><th>行数</th><th>代码</th><th>最新日"
+               "</th></tr>" + crows + "</table>") if crows else "<p>空</p>")
+    drows = "".join("<tr><td><strong>" + _esc(k) + "</strong></td><td>"
+                    + _esc(v) + "</td></tr>"
+                    for k, v in (s.get("dbs") or {}).items())
+    bhtml = "".join(
+        "<h4>" + _esc(x.get("file")) + "</h4><pre>"
+        + _esc(x.get("head", "")) + "</pre>"
+        for x in (s.get("backtest") or []))
+    lhtml = "".join(
+        "<h4>" + _esc(k) + "</h4><pre>" + _esc(v) + "</pre>"
+        for k, v in (s.get("logs") or {}).items())
+    return ("<div class='card'><h2>🍓 " + PI_HOST_TITLE
+            + " <span class='meta'>数据生成 " + _esc(s.get("generated"))
+            + "</span></h2><p>" + badges + "</p><table>" + mrows
+            + "</table></div>"
+            + "<h2>Pi 多市场模拟盘</h2><div class='grid'>" + ac_html + "</div>"
+            + "<div class='card'><h2>Pi 数据范围</h2>" + c_html + "</div>"
+            + "<div class='card'><h2>Pi 库文件</h2><table>" + drows
+            + "</table></div>"
+            + "<div class='card'><h2>Pi 回测摘要</h2>" + bhtml + "</div>"
+            + "<div class='card'><h2>Pi 最近日志</h2>" + lhtml + "</div>")
+
+
 def quant_page():
     machine = machine_status()
     services = service_status()
@@ -1381,6 +1483,7 @@ def quant_page():
     db_rows = "".join(f"<tr><td><strong>{k}</strong></td><td>{v}</td></tr>" for k, v in dbs.items())
 
     content = f"""
+    {pi_status_html(pi_status_snapshot())}
     <h1>🖥️ Quant 状态</h1>
     <div class="meta">{HOST_LABEL} | 公网: <a href="https://quant.tail6a6cc8.ts.net/">https://quant.tail6a6cc8.ts.net/</a></div>
 
