@@ -184,6 +184,9 @@ def main(argv=None):
 
     calendar = TradingCalendar()
     now = datetime.now()
+    if not calendar.is_trading_day(now.date()):
+        print(f"=== 非交易日({now:%Y-%m-%d %A})，休市不产生交易，跳过模拟盘 ===")
+        return
     trade_date = calendar.trade_date_of(now)
     next_date = str(calendar.next_trading_day(trade_date))
     stamp = intraday.session_time(now)

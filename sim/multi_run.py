@@ -35,6 +35,16 @@ def _universe(market, limit):
     from data import unified as u
     from data.universe_filter import liquid_top
     all_u = u.universe(market)
+    # 非交易日闸门：加密 7x24 直跑，其余市场周末/节假日不产生交易/状态写入
+    if market != "crypto":
+        try:
+            from trading.calendar import TradingCalendar as _TC
+            import datetime as _dt
+            if not _TC().is_trading_day(_dt.date.today()):
+                print(f"[{market}] 非交易日，跳过（休市无交易）")
+                return {"market": market, "skipped": "non-trading-day"}
+        except Exception:
+            pass
     if market == "crypto":
         return liquid_top(market, all_u,
                           lambda c, tail=150: u.get_bars(c, tail=tail),

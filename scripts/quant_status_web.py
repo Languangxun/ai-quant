@@ -899,6 +899,13 @@ def market_account(market):
                         lots.append(lot)
             elif isinstance(arr, dict):
                 lots.append(arr)
+    mtime = ""
+    try:
+        mtime = time.strftime("%m-%d %H:%M", time.localtime(
+            os.path.getmtime(os.path.join(
+                STATE_DIR, f"multi-{market}.json"))))
+    except OSError:
+        pass
     return {
         "initial": fmt_money(initial),
         "cash": fmt_money(acct.get("cash", 0)),
@@ -907,6 +914,7 @@ def market_account(market):
         "fees": fmt_money(acct.get("fees", 0)),
         "trade_count": acct.get("trade_count", 0),
         "lots": lots,
+        "state_mtime": mtime,
     }
 
 
@@ -1354,7 +1362,7 @@ def pi_status_html(snap=None):
     ac_html = ""
     for name in ("fund", "hk", "us", "crypto", "fut"):
         a = s.get("accounts", {}).get(name) or {}
-        if not isinstance(a, dict) or not (a.get("总资产") or a.get("交易数")):
+        if not isinstance(a, dict) or not (a.get("总资产") or a.get("交易数(累计)")):
             ac_html += ("<div class='card'><h3>" + name.upper()
                         + " 模拟盘</h3><p>无状态</p></div>")
             continue
@@ -1363,7 +1371,7 @@ def pi_status_html(snap=None):
         body = ("<p><strong>总资产:</strong> " + _esc(a.get("总资产", "-"))
                 + " | <strong>现金:</strong> " + _esc(a.get("现金", "-"))
                 + " | <strong>收益:</strong> " + ret_txt
-                + " | <strong>交易:</strong> " + _esc(a.get("交易数", 0))
+                + " | <strong>交易(累计):</strong> " + _esc(a.get("交易数(累计)", 0))
                 + "</p>")
         rows = "".join(
             "<tr><td>" + _esc(l.get("code")) + "</td><td>"
@@ -1451,14 +1459,21 @@ def quant_page():
                      "".join(lots_rows) + "</table>") if lots_rows else "<p>当前无持仓</p>"
         market_cards.append(f"""
         <div class="card">
-            <h3>{m.upper()} 模拟盘</h3>
+            <h3>{m.upper()} 模拟盘<span class="meta" style="font-size:11px;color:var(--muted)"> 状态文件更新 {info.get('state_mtime','-')}（累计口径）</span></h3>
             <p><strong>初始:</strong> {info['initial']} &nbsp;|&nbsp; <strong>总资产:</strong> {info['total']} &nbsp;|&nbsp;
                <strong>收益:</strong> {info['return']} &nbsp;|&nbsp; <strong>现金:</strong> {info['cash']} &nbsp;|&nbsp;
-               <strong>成交:</strong> {info['trade_count']}</p>
+               <strong>成交(累计):</strong> {info['trade_count']}</p>
             {lots_html}
         </div>
         """)
 
+    stock = dict(stock) if stock else {}
+    try:
+        stock["状态文件更新"] = time.strftime("%m-%d %H:%M", time.localtime(
+            os.path.getmtime(os.path.join(STATE_DIR, "stock_account.json"))))
+        stock["成交(累计)"] = stock.pop("trade_count", stock.get("成交(累计)", "-"))
+    except OSError:
+        pass
     stock_html = "<p>无状态文件</p>" if not stock else (
         "".join(f"<tr><td><strong>{k}</strong></td><td>{v}</td></tr>" for k, v in stock.items())
     )

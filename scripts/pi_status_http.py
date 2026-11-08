@@ -135,8 +135,14 @@ def account(m):
                                  "shares": single.get("shares"),
                                  "cost": single.get("cost"),
                                  "pnl_pct": single.get("pnl_pct")})
+    mtime = ""
+    try:
+        mtime = time.strftime("%m-%d %H:%M", time.localtime(os.path.getmtime(p)))
+    except OSError:
+        pass
     return {"总资产": total, "现金": acct.get("cash"),
-            "收益": ret, "交易数": acct.get("trade_count"), "持仓": lots}
+            "收益": ret, "交易数(累计)": acct.get("trade_count", 0),
+            "持仓": lots, "状态文件更新": mtime}
 
 
 def stock_account():
@@ -146,9 +152,15 @@ def stock_account():
             d = json.load(f)
     except OSError:
         return None
+    mtime = ""
+    try:
+        mtime = time.strftime("%m-%d %H:%M", time.localtime(
+            os.path.getmtime(os.path.join(STATE_DIR, "stock_account.json"))))
+    except OSError:
+        pass
     return {"现金": d.get("cash"), "总资产": d.get("total_asset"),
-            "交易数": d.get("trade_count"), "日期": d.get("date"),
-            "持仓数": len(d.get("positions") or {})}
+            "交易数(累计)": d.get("trade_count", 0), "日期": d.get("date"),
+            "持仓数": len(d.get("positions") or {}), "状态文件更新": mtime}
 
 
 def backtests():
