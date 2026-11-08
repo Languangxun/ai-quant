@@ -32,7 +32,31 @@ import urllib.request
 CONFIG_PATH = os.path.expanduser(
     "~/.config/ai-quant/foreign_search.env")
 DEFAULT_PROXY = "http://127.0.0.1:7890"
-DEFAULT_ENGINES = ("google-news", "bing", "duckduckgo")
+DEFAULT_ENGINES = ("google-news", "bing", "duckduckgo", "wsj", "investing")
+
+# 英文财经 RSS 源（免费、无需 key；经代理抓取）
+RSS_SOURCES = {
+    "wsj": [
+        ("https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
+         "WSJ Markets"),
+        ("https://feeds.content.dowjones.io/public/rss/RSSWorldNews",
+         "WSJ World"),
+        ("https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness",
+         "WSJ Business"),
+        ("https://feeds.content.dowjones.io/public/rss/RSSWSJD", "WSJ Tech"),
+    ],
+    "investing": [
+        ("https://www.investing.com/rss/news.rss", "Investing All"),
+        ("https://www.investing.com/rss/news_25.rss", "Investing Stocks"),
+        ("https://www.investing.com/rss/news_14.rss", "Investing Forex"),
+        ("https://www.investing.com/rss/news_11.rss", "Investing Crypto"),
+        ("https://www.investing.com/rss/news_20.rss", "Investing Commodities"),
+    ],
+    "cnbc": [("https://www.cnbc.com/id/100003114/device/rss/rss.html", "CNBC Top"),
+             ("https://www.cnbc.com/id/10000664/device/rss/rss.html", "CNBC Markets")],
+    "marketwatch": [("https://feeds.content.dowjones.io/public/rss/mw_topstories",
+                     "MarketWatch Top")],
+}
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_COUNT = 8
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -254,6 +278,63 @@ def _engine_url(engine, query, count, days=7):
     return ""
 
 
+def _parse_rss_feed(raw, engine, source_name=""):
+    """通用 RSS 2.0 解析（WSJ/Investing/CNBC/MarketWatch 共用）。"""
+    import xml.etree.ElementTree as ET
+    out = []
+    try:
+        root = ET.fromstring(raw)
+    except Exception:
+        return out
+    for item in root.iter("item"):
+        title = _text(item.findtext("title") or "")
+        link = (item.findtext("link") or "").strip()
+        desc = _text(item.findtext("description") or "")
+        pub = (item.findtext("pubDate") or "").strip()
+        date = ""
+        m = re.search(r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})", pub)
+        if m:
+            try:
+                from datetime import datetime as _dt
+                date = _dt.strptime(
+                    f"{m.group(1)} {m.group(2)} {m.group(3)}",
+                    "%d %b %Y").strftime("%Y-%m-%d")
+            except ValueError:
+                date = ""
+        if not date:
+            from datetime import datetime as _dt
+            for fmt in ("%a, %d %b %Y %H:%M:%S %z",
+                        "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    date = _dt.strptime(pub, fmt).strftime("%Y-%m-%d")
+                    break
+                except (ValueError, TypeError):
+                    continue
+        if title and link.startswith("http"):
+            out.append({"title": title, "url": link,
+                        "summary": desc[:600], "date": date,
+                        "site": source_name or engine, "engine": engine})
+    return out
+
+
+def _fetch_rss_engine(engine, proxy, timeout, per_feed=6):
+    """抓取 RSS 源组（wsj/investing/cnbc/marketwatch），按时间排序。"""
+    feeds = RSS_SOURCES.get(engine) or []
+    out = []
+    for url, name in feeds:
+        try:
+            raw = _fetch(url, proxy, timeout)
+            rows = _parse_rss_feed(raw, engine, name)
+        except Exception as e:
+            print(f"[foreign_search] {engine}({name}) 失败: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            rows = []
+        rows.sort(key=lambda x: x.get("date") or "", reverse=True)
+        out.extend(rows[:per_feed])
+    out.sort(key=lambda x: x.get("date") or "", reverse=True)
+    return out
+
+
 def _parse_google_news(raw):
     """Google News RSS（XML）解析；比抓 Google 搜索结果稳定得多。"""
     import xml.etree.ElementTree as ET
@@ -373,6 +454,15 @@ def search(query, engines=None, count=DEFAULT_COUNT, proxy=None,
     seen, out = set(), []
     for engine in engines:
         engine = str(engine or "").strip().lower()
+        # RSS 英文财经源组：直接抓最新新闻流
+        if engine in RSS_SOURCES and not x_site:
+            for row in _fetch_rss_engine(engine, proxy, timeout,
+                                         per_feed=max(3, count // 2)):
+                key = re.sub(r"[?#].*$", "", row.get("url") or "").lower()
+                if key and key not in seen:
+                    seen.add(key)
+                    out.append(row)
+            continue
         url = _engine_url(engine, query, count, days)
         if not url:
             continue
@@ -425,6 +515,8 @@ def check(proxy=None, timeout=10.0):
         "google": "https://www.google.com/generate_204",
         "x": "https://x.com/robots.txt",
         "duckduckgo": "https://duckduckgo.com/robots.txt",
+        "wsj": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+        "investing": "https://www.investing.com/rss/news.rss",
     }
     out = {}
     for name, url in targets.items():

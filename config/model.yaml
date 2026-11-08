@@ -46,7 +46,8 @@ models:
     # 代理地址和 Clash 订阅只放 Pi 本地 ~/.config/ai-quant/，绝不入库。
     foreign:
       enabled: true
-      engines: ["google-news", "bing", "duckduckgo"]  # Google News 最稳
+      engines: ["google-news", "bing", "duckduckgo", "wsj", "investing"]
+      # wsj=华尔街日报 RSS；investing=Investing.com RSS（英文财经主源）
       count: 5
       timeout: 8
       days: 3
