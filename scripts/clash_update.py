@@ -110,6 +110,26 @@ def update(no_restart=False, proxy=None):
                   file=sys.stderr)
             return 1
         os.replace(tmp, CONFIG)
+        # === 持久规则注入（东财接口走代理，防水口被 IP 级 ban：给 quant 板块快照兜底） ===
+        try:
+            rules_marker = "DOMAIN-SUFFIX,eastmoney.com"
+            if rules_marker not in raw:
+                lines = raw.split("\n")
+                for i, line in enumerate(lines):
+                    if line.strip().startswith("rules:"):
+                        lines.insert(
+                            i + 1,
+                            "  - DOMAIN-SUFFIX,eastmoney.com,🔰 选择节点")
+                        break
+                raw2 = "\n".join(lines)
+                with open(CONFIG, "w", encoding="utf-8") as f2:
+                    f2.write(raw2)
+                raw = raw2
+                print("[clash] 注入 eastmoney 代理规则")
+            else:
+                print("[clash] eastmoney 代理规则已存在")
+        except Exception as e:
+            print(f"[clash] 规则注入失败: {e}", file=sys.stderr)
     finally:
         try:
             os.remove(tmp)
