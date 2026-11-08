@@ -1088,8 +1088,9 @@ def nav(active=""):
     return f"""
     <nav class="navbar">
         <div class="nav-brand">
-            <span class="logo">Q</span>
-            <span>Quant Dashboard</span>
+            <img src="/web_assets/logo.png" alt="观潮量化"
+                 style="width:30px;height:30px;border-radius:6px;object-fit:cover"/>
+            <span>观潮量化 <span style="color:var(--muted);font-size:12px;letter-spacing:.5px">GUANCHAO QUANT</span></span>
         </div>
         <div class="nav-links">
             {"".join(links)}
@@ -1138,7 +1139,8 @@ def base_page(title, content, active=""):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{title}</title>
+<link rel="icon" href="/web_assets/favicon.png" type="image/png">
+<title>观潮量化 · {title}</title>
 <style>
 :root {{ --bg: #0b0e11; --surface: #151a21; --surface-2: #1e2530; --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff; --accent-2: #238636; --up: #3fb950; --down: #f85149; --border: #30363d; }}
 * {{ box-sizing: border-box; }}
@@ -1203,10 +1205,11 @@ pre {{ background: var(--bg); padding: 12px; border-radius: 6px; overflow-x: aut
 </div>
 <footer style="border-top:1px solid var(--border);margin-top:28px;padding:18px 24px;text-align:center;color:var(--muted);font-size:12px">
   <div style="display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap">
-    <img src="/web_assets/logo.png" alt="stock-analyzer"
-         style="height:44px;border-radius:6px;display:inline-block"
+    <img src="/web_assets/logo.png" alt="观潮量化"
+         style="height:44px;border-radius:8px;display:inline-block"
          onerror="this.style.display='none'"/>
-    <span style="font-size:13px;color:var(--text)">stock-analyzer</span>
+    <span style="font-size:14px;color:var(--text);font-weight:600">观潮量化</span>
+    <span style="font-size:11px;color:var(--muted);letter-spacing:1px">GUANCHAO QUANT</span>
     <span style="opacity:.55">·</span>
     <span>Powered by 獨白量化</span>
     <span style="opacity:.55">·</span>
@@ -1320,7 +1323,7 @@ def index_page():
 
     {sparkline_js()}
     """
-    return base_page("Quant 行情看板", content, active="/")
+    return base_page("行情看板", content, active="/")
 
 
 # ============== Pi 节点精华（OrangePi 状态聚合，网站 /quant 嵌入） ==============
@@ -1533,7 +1536,7 @@ def quant_page():
     <div class="card"><h2>Cron 任务</h2>{cron_html}</div>
     <div class="card"><h2>Tailscale 穿透</h2>{ts_html}</div>
     """
-    return base_page("Quant 状态", content, active="/quant")
+    return base_page("状态", content, active="/quant")
 
 
 def projects_page():
@@ -1870,8 +1873,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_response(403)
                     self.end_headers()
                     self.wfile.write(b"forbidden or not found")
-            elif path == "/web_assets/logo.png":
-                logo = os.path.join(BASE_DIR, "scripts", "web_assets", "logo.png")
+            elif path in ("/web_assets/logo.png", "/web_assets/favicon.png"):
+                logo = os.path.join(BASE_DIR, "scripts", "web_assets",
+                                    os.path.basename(path))
                 if os.path.exists(logo):
                     send_file_with_range(self, logo)
                 else:
