@@ -24,6 +24,15 @@ archive/
 # 收件箱：运行时数据（推送的报告 JSON）
 memory/inbox/
 
+
+# === sm701 生成物与模型（停止上传，用户指令）===
+factors/sm701.py
+tests/test_sm701_universal.py
+scripts/cli/stock_predict.py
+scripts/cli/stock_predict.py.*
+vendors/sm701/
+logs/ablation-*
+
 # CLI 缓存/日志（不入库；stock_predict.py 源码入库，随仓库分发）
 scripts/cli/stock_cache.db*
 scripts/cli/stock_gui.log
