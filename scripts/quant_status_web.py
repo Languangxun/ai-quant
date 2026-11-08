@@ -1348,8 +1348,9 @@ def pi_status_html(snap=None):
     """渲染 Pi 精华为 HTML 卡片（嵌入网站 /quant 页）。"""
     s = snap if snap is not None else pi_status_snapshot()
     if s.get("unreachable"):
-        return ("<div class='card'><h2>" + PI_HOST_TITLE + "</h2>"
-                + "<p>未联通: " + _esc(s.get("error")) + "</p>"
+        return ("<div class='card'><h2>" + PI_HOST_TITLE
+                + " <span class='meta'>状态退役</span></h2>"
+                + "<p>nu Pi 已关机退役（2026-11-08），状态卡停更。</p>"
                 + "<div class='meta'>url: " + _esc(s.get("url", "")) + "</div></div>")
     m = s.get("machine") or {}
     mrows = "".join("<tr><td><strong>" + _esc(k) + "</strong></td><td>"
