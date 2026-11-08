@@ -1648,7 +1648,7 @@ _DOCS_INTRO = """
 <p>Base URL：</p>
 <pre>https://quant.tail6a6cc8.ts.net          # Tailscale 域名（账号内免鉴权直达）
 http://100.126.30.51:8080                # 纯内网 IP 直连（同 tailnet 内更快）</pre>
-<p>所有响应为 UTF-8 JSON；站点仅对 Tailscale 网络/账号可见，暂不开放公网注册。</p>
+<p>所有响应为 UTF-8 JSON。行情源已公网开放（HTTPS 只读、免鉴权），任何联网环境可直接调用。</p>
 """
 
 _DOCS_QUICK = """
