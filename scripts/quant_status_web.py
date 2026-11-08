@@ -1538,9 +1538,16 @@ function drawEquity(canvasId, seriesList, opts){
   var chartW = W - pad.left - pad.right, chartH = H - pad.top - pad.bottom;
   var bg = getComputedStyle(document.body).getPropertyValue('--bg').trim() || '#0b0e11';
   ctx.fillStyle = bg; ctx.fillRect(0,0,W,H);
-  var n = 0;
-  seriesList.forEach(function(s){ n = Math.max(n, (s.points||[]).length); });
+  // ---- 统一日期轴（不同长度曲线按真实日期对齐） ----
+  var dateSet = {};
+  seriesList.forEach(function(s){
+    (s.points||[]).forEach(function(p){ dateSet[p[0]] = 1; });
+  });
+  var dates = Object.keys(dateSet).sort();
+  var n = dates.length;
   if(!n) return;
+  var di = {};
+  dates.forEach(function(d, i){ di[d] = i; });
   var min = Infinity, max = -Infinity;
   seriesList.forEach(function(s){
     (s.points||[]).forEach(function(p){
@@ -1554,7 +1561,6 @@ function drawEquity(canvasId, seriesList, opts){
   min -= padV; max += padV;
   function x(i){ return pad.left + (n <= 1 ? 0 : i / (n - 1) * chartW); }
   function y(v){ return pad.top + (max - v) / (max - min) * chartH; }
-  // 网格
   ctx.strokeStyle = '#21262d'; ctx.lineWidth = 1;
   ctx.beginPath();
   for(var i=0;i<=4;i++){
@@ -1568,34 +1574,32 @@ function drawEquity(canvasId, seriesList, opts){
     var gv = max - (max-min) * i / 4;
     ctx.fillText(gv.toFixed(3), 4, gy + 3);
   }
-  // 曲线
-  var colors = opts.colors || ['#3fb950','#58a6ff','#f0883e','#a371f7','#f85149'];
+  var colors = opts.colors || ['#3fb950','#58a6ff','#f0883e','#a371f7','#f85149','#d29922'];
   seriesList.forEach(function(s, si){
     var pts = s.points || [];
     if(pts.length < 2) return;
     ctx.strokeStyle = colors[si % colors.length];
     ctx.lineWidth = 1.6; ctx.beginPath();
-    var started = false;
-    for(var i=0;i<pts.length;i++){
-      var px = x(i), py = y(pts[i][1]);
-      if(!started){ ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py);
+    var started = false, prevIdx = -2;
+    for(var k=0;k<pts.length;k++){
+      var d = pts[k][0], v = pts[k][1];
+      var i = di[d];
+      if(i === undefined) continue;
+      var px = x(i), py = y(v);
+      if(!started || i !== prevIdx + 1){ ctx.moveTo(px, py); started = true; }
+      else ctx.lineTo(px, py);
+      prevIdx = i;
     }
     ctx.stroke();
   });
-  // 日期轴
-  var first = (seriesList[0].points || []);
-  var lastPts = first;
-  if(lastPts.length){
-    ctx.fillStyle = '#8b949e'; ctx.font = '10px sans-serif'; ctx.textAlign = 'left';
-    var ticks = [0, Math.floor((lastPts.length-1)/2), lastPts.length-1];
-    var seenX = {};
-    ticks.forEach(function(i){
-      var px = x(i);
-      if(seenX[Math.round(px)]) return; seenX[Math.round(px)] = 1;
-      ctx.fillText(String(lastPts[i][0]).slice(5), px-16, H-8);
-    });
-  }
-  // 图例
+  ctx.fillStyle = '#8b949e'; ctx.font = '10px sans-serif'; ctx.textAlign = 'left';
+  var tickIdx = [0, Math.floor((n-1)/2), n-1];
+  var seenX = {};
+  tickIdx.forEach(function(i){
+    var px = x(i);
+    if(seenX[Math.round(px)]) return; seenX[Math.round(px)] = 1;
+    ctx.fillText(String(dates[i]).slice(5), px-16, H-8);
+  });
   var lx = pad.left + 4, ly = pad.top - 10;
   ctx.font = '11px sans-serif'; ctx.textAlign = 'left';
   seriesList.forEach(function(s, si){
@@ -1605,69 +1609,117 @@ function drawEquity(canvasId, seriesList, opts){
     ctx.fillText(s.label, lx+15, ly-2);
     lx += ctx.measureText(s.label).width + 38;
   });
-  // 末值标签
   seriesList.forEach(function(s, si){
     var pts = s.points || [];
     if(!pts.length) return;
     ctx.fillStyle = colors[si % colors.length];
     ctx.font = '11px monospace';
-    ctx.fillText(pts[pts.length-1][1].toFixed(3), W-pad.right-52, y(pts[pts.length-1][1]) - 6 + si*13);
+    var lp = pts[pts.length-1];
+    ctx.fillText(String(lp[1].toFixed ? lp[1].toFixed(3) : lp[1]), W-pad.right-52, y(lp[1]) - 6 + si*13);
   });
 }
 """
 
 
-def equity_charts_html():
-    """回测/模拟盘净值图表卡片。"""
-    import json as _json
+def desktop_dashboard_curves():
+    """桌面 stock_predict 回测仪表盘的归一化三档曲线（data/dashboard_tiers.json）。"""
+    d = read_json(os.path.join(BASE_DIR, "data", "dashboard_tiers.json"))
+    if not isinstance(d, dict):
+        return None
+    tiers = d.get("tiers") or {}
+    series, bench = [], None
+    for name in ("稳健", "均衡", "激进"):
+        t = tiers.get(name) or {}
+        if not (t.get("curve") and t.get("dates")):
+            continue
+        series.append({"label": name,
+                       "points": list(zip(t["dates"], t["curve"]))})
+        if bench is None and t.get("bench_curve") and t.get("bench_dates"):
+            bench = {"label": t.get("benchmark") or "基准",
+                     "points": list(zip(t["bench_dates"], t["bench_curve"]))}
+    if not series:
+        return None
+    if bench and len(bench["points"]) >= 2:
+        series.append(bench)
+    return {"version": d.get("version"), "ts": d.get("ts"),
+            "segment": d.get("segment"), "data_end": d.get("data_end"),
+            "series": series}
+
+
+def equity_payload():
+    """图表数据 API：各市场回测 + A股回测 + 模拟盘 + 桌面三档。"""
+    charts = {}
     multi = multi_backtest_curves()
+    if multi:
+        charts["eqMulti"] = [{"label": v["label"], "points": v["curve"]}
+                             for v in multi.values()]
     stock_bt = latest_stock_backtest()
-    stock_sim = stock_daily_curve()
-    blocks = []
-    if multi:
-        series = [{"label": v["label"], "points": v["curve"]}
-                  for v in multi.values()]
-        blocks.append(
-            '<div class="card"><h2>各市场回测净值（归一化）</h2>'
-            '<canvas id="eqMulti" style="width:100%;display:block"></canvas>'
-            '<div class="meta" style="margin-top:8px">'
-            + "；".join(f'{v["label"]}: {v["file"]}' for v in multi.values())
-            + "</div></div>")
-    if stock_bt:
-        series = [{"label": "策略", "points": stock_bt["equity"]}]
-        if stock_bt["bench"]:
-            series.append({"label": "等权基准", "points": stock_bt["bench"]})
-        if stock_bt["index"]:
-            series.append({"label": "上证指数", "points": stock_bt["index"]})
-        blocks.append(
-            '<div class="card"><h2>A股策略回测净值（最新一份）</h2>'
-            '<canvas id="eqStockBt" style="width:100%;display:block"></canvas>'
-            '<div class="meta" style="margin-top:8px">文件：'
-            + stock_bt["file"] + "</div></div>")
-    if len(stock_sim) >= 2:
-        blocks.append(
-            '<div class="card"><h2>A股模拟盘每日净值（真实跑盘快照）</h2>'
-            '<canvas id="eqStockSim" style="width:100%;display:block"></canvas>'
-            "</div>")
-    if not blocks:
-        return ""
-    data_js = []
-    if multi:
-        data_js.append(("eqMulti", [{"label": v["label"], "points": v["curve"]}
-                                    for v in multi.values()]))
     if stock_bt:
         ss = [{"label": "策略", "points": stock_bt["equity"]}]
         if stock_bt["bench"]:
             ss.append({"label": "等权基准", "points": stock_bt["bench"]})
         if stock_bt["index"]:
             ss.append({"label": "上证指数", "points": stock_bt["index"]})
-        data_js.append(("eqStockBt", ss))
+        charts["eqStockBt"] = ss
+    stock_sim = stock_daily_curve()
     if len(stock_sim) >= 2:
-        data_js.append(("eqStockSim", [{"label": "模拟盘", "points": stock_sim}]))
-    js_calls = "".join(
-        f"drawEquity({_json.dumps(cid)}, {_json.dumps(series, ensure_ascii=False)}, {{height:320}});"
-        for cid, series in data_js)
-    return ("".join(blocks) + "<script>" + EQUITY_JS + js_calls + "</script>")
+        charts["eqStockSim"] = [{"label": "模拟盘", "points": stock_sim}]
+    dash = desktop_dashboard_curves()
+    if dash:
+        charts["eqDashboard"] = dash["series"]
+    return {"charts": charts, "multi_files": {
+        m: v.get("file") for m, v in multi.items()},
+        "stock_file": (stock_bt or {}).get("file"),
+        "dashboard_meta": ({k: (dash or {}).get(k) for k in
+                            ("version", "ts", "segment", "data_end")}
+                           if dash else None)}
+
+
+def equity_charts_html():
+    """回测/模拟盘净值图表卡片（数据走 /api/equity）。"""
+    multi = multi_backtest_curves()
+    stock_bt = latest_stock_backtest()
+    stock_sim = stock_daily_curve()
+    dash = desktop_dashboard_curves()
+    blocks = []
+    if multi:
+        blocks.append(
+            '<div class="card"><h2>各市场回测净值（归一化，按日期对齐）</h2>'
+            '<canvas id="eqMulti" style="width:100%;display:block"></canvas>'
+            '<div class="meta" style="margin-top:8px">'
+            + "；".join(f'{v["label"]}: {v["file"]}' for v in multi.values())
+            + "</div></div>")
+    if stock_bt:
+        blocks.append(
+            '<div class="card"><h2>A股策略回测净值（最新一份 · 本机组合账户口径）</h2>'
+            '<canvas id="eqStockBt" style="width:100%;display:block"></canvas>'
+            '<div class="meta" style="margin-top:8px">文件：'
+            + stock_bt["file"] + "</div></div>")
+    if len(stock_sim) >= 2:
+        blocks.append(
+            '<div class="card"><h2>A股模拟盘每日净值（真实跑盘快照）</h2>'
+            '<canvas id="eqStockSim" style="width:100%;display:block"></canvas></div>')
+    if dash:
+        blocks.append(
+            '<div class="card"><h2>桌面 stock_predict 三档净值'
+            '（v' + str(dash.get("version")) + ' · ' + str(dash.get("segment"))
+            + ' · 至 ' + str(dash.get("data_end")) + '）</h2>'
+            '<canvas id="eqDashboard" style="width:100%;display:block"></canvas>'
+            '<div class="meta" style="margin-top:8px">与桌面回测仪表盘同源'
+            '（单股事件回测 + 相位平均，三档）；与本机组合级账户回测口径不同，'
+            '数值不应直接对比。</div></div>')
+    if not blocks:
+        return ""
+    js = ("<script>"
+          "fetch('/api/equity').then(function(r){return r.json();})"
+          ".then(function(d){"
+          "var c=d.charts||{};"
+          "Object.keys(c).forEach(function(id){"
+          "drawEquity(id, c[id], {height:320});"
+          "});"
+          "}).catch(function(e){console.error('equity load', e);});"
+          "</script>")
+    return ("".join(blocks) + "<script>" + EQUITY_JS + "</script>" + js)
 
 
 def quant_page():
@@ -2082,6 +2134,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._html(quant_page())
             elif path == "/projects":
                 self._html(projects_page())
+            elif path == "/api/equity":
+                self._json(equity_payload())
             elif path == "/api/markets":
                 self._json(get_market_data())
             elif path == "/api/quote":
