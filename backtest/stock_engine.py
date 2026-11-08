@@ -114,7 +114,7 @@ class StockBacktest:
                  max_position_pct=None, min_order_amount=None,
                  exec_px=None, check_limit=True, min_bars=None,
                  start=None, end=None, limit=0, boards=None, progress=print,
-                 include_etf=None):
+                 include_etf=None, sig_mode="composite"):
         cfg = _load_cfg()
         self.cfg = cfg
         self.market = MarketModel(cfg)
@@ -136,6 +136,7 @@ class StockBacktest:
         self.min_order_pct = float(cfg.get("min_order_pct", 5.0))
         self.exec_px = exec_px or cfg.get("exec_px", "close")
         self.check_limit = check_limit
+        self.sig_mode = sig_mode or "composite"
         self.min_bars = int(min_bars or cfg["universe"]["min_bars"])
         self.start = start or cfg.get("backtest", {}).get("start") or ""
         self.end = end or ""
@@ -191,7 +192,16 @@ class StockBacktest:
                     b[0] += p1 / p0 - 1.0
                     b[1] += 1
             try:
-                sigs = bridge.signals(rows, self.risk_mode)
+                if getattr(self, "sig_mode", "composite") == "sector_rot":
+                    cli = bridge.load()
+                    with cli.db_conn() as conn:
+                        r0 = conn.execute(
+                            "select industry from stocks where code=?",
+                            (code,)).fetchone()
+                    ind = (r0[0] if r0 else "") or ""
+                    sigs = cli._sig_sector_rot(rows, industry=ind)
+                else:
+                    sigs = bridge.signals(rows, self.risk_mode)
             except Exception as e:
                 self.progress(f"  [warn] {code} 信号失败: {e}")
                 continue

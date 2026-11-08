@@ -34,13 +34,15 @@ def main():
                     help="股票池剔除ETF")
     ap.add_argument("--exec-px", default=None, choices=["close", "open"])
     ap.add_argument("--tag", default=None, help="结果文件名标签")
+    ap.add_argument("--sig", default=None, choices=["composite", "sector_rot"],
+                    help="信号族：composite=多维评分（默认）, sector_rot=板块轮动（桌面激进档同源）")
     args = ap.parse_args()
 
     bt = StockBacktest(
         capital=args.capital, risk_mode=args.mode,
         max_positions=args.max_positions, start=args.start, end=args.end,
         limit=args.limit, exec_px=args.exec_px, boards=args.boards,
-        include_etf=args.include_etf,
+        include_etf=args.include_etf, sig_mode=args.sig or "composite",
     )
     bt.run()
     print(json.dumps(bt.stats, ensure_ascii=False, indent=2, default=str))
