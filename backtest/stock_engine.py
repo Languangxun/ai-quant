@@ -137,6 +137,7 @@ class StockBacktest:
         self.exec_px = exec_px or cfg.get("exec_px", "close")
         self.check_limit = check_limit
         self.sig_mode = sig_mode or "composite"
+        self.custom_signal_fn = None  # 可注入: fn(rows, code) -> [(i,date,BUY/SELL,reason)]
         self.min_bars = int(min_bars or cfg["universe"]["min_bars"])
         self.start = start or cfg.get("backtest", {}).get("start") or ""
         self.end = end or ""
@@ -192,7 +193,9 @@ class StockBacktest:
                     b[0] += p1 / p0 - 1.0
                     b[1] += 1
             try:
-                if getattr(self, "sig_mode", "composite") == "sector_rot":
+                if self.custom_signal_fn:
+                    sigs = self.custom_signal_fn(rows, code)
+                elif getattr(self, "sig_mode", "composite") == "sector_rot":
                     cli = bridge.load()
                     with cli.db_conn() as conn:
                         r0 = conn.execute(
