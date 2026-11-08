@@ -1645,13 +1645,53 @@ def desktop_dashboard_curves():
             "series": series}
 
 
+_ALL_MARKET_LABEL = {"fund": "基金", "hk": "港股", "us": "美股",
+                      "crypto": "加密", "fut": "期货", "cn": "A股"}
+
+
+def unified_market_comparison():
+    """各市场回测统一区间对比：取所有曲线日期交集，裁剪后重新归一化。"""
+    multi = multi_backtest_curves()
+    series_raw, ranges = {}, {}
+    for m, v in multi.items():
+        pts = v.get("curve") or []
+        if len(pts) < 5:
+            continue
+        series_raw[m] = pts
+        ranges[m] = [pts[0][0], pts[-1][0]]
+    stock_bt = latest_stock_backtest()
+    if stock_bt and len(stock_bt.get("equity") or []) >= 5:
+        pts = stock_bt["equity"]
+        series_raw["cn"] = pts
+        ranges["cn"] = [pts[0][0], pts[-1][0]]
+    if not series_raw:
+        return None
+    start = max(p[0][0] for p in series_raw.values())
+    end = min(p[-1][0] for p in series_raw.values())
+    if start >= end:
+        return None
+    out = []
+    for key, pts in series_raw.items():
+        clip = [(d, v) for d, v in pts if start <= d <= end]
+        if len(clip) < 3:
+            continue
+        base = clip[0][1] or 1.0
+        out.append({"label": _ALL_MARKET_LABEL.get(key, key),
+                    "points": [(d, round(float(v) / base, 4)) for d, v in clip]})
+    if len(out) < 2:
+        return None
+    return {"start": start, "end": end, "series": out,
+            "ranges": {_ALL_MARKET_LABEL.get(k, k): v
+                       for k, v in ranges.items()}}
+
+
 def equity_payload():
     """图表数据 API：各市场回测 + A股回测 + 模拟盘 + 桌面三档。"""
     charts = {}
     multi = multi_backtest_curves()
-    if multi:
-        charts["eqMulti"] = [{"label": v["label"], "points": v["curve"]}
-                             for v in multi.values()]
+    unified = unified_market_comparison()
+    if unified:
+        charts["eqMulti"] = unified["series"]
     stock_bt = latest_stock_backtest()
     if stock_bt:
         ss = [{"label": "策略", "points": stock_bt["equity"]}]
@@ -1668,6 +1708,9 @@ def equity_payload():
         charts["eqDashboard"] = dash["series"]
     return {"charts": charts, "multi_files": {
         m: v.get("file") for m, v in multi.items()},
+        "unified_range": ([unified["start"], unified["end"]]
+                          if unified else None),
+        "raw_ranges": (unified or {}).get("ranges"),
         "stock_file": (stock_bt or {}).get("file"),
         "dashboard_meta": ({k: (dash or {}).get(k) for k in
                             ("version", "ts", "segment", "data_end")}
@@ -1682,12 +1725,20 @@ def equity_charts_html():
     dash = desktop_dashboard_curves()
     blocks = []
     if multi:
+        unified = unified_market_comparison()
+        rng = (f'{unified["start"]} ~ {unified["end"]}'
+               if unified else "交集不足")
+        raw = ""
+        if unified:
+            raw = "；".join(f'{k}: {v[0]} ~ {v[1]}'
+                           for k, v in unified["ranges"].items())
         blocks.append(
-            '<div class="card"><h2>各市场回测净值（归一化，按日期对齐）</h2>'
+            '<div class="card"><h2>各市场回测净值（统一区间对比 · '
+            + rng + '）</h2>'
             '<canvas id="eqMulti" style="width:100%;display:block"></canvas>'
-            '<div class="meta" style="margin-top:8px">'
-            + "；".join(f'{v["label"]}: {v["file"]}' for v in multi.values())
-            + "</div></div>")
+            '<div class="meta" style="margin-top:8px">各市场原始区间：'
+            + raw + "；已统一裁剪到交集区间并以区间起点重新归一化，"
+            '横向可比。A股为本机组合账户回测（非单股事件口径）。</div></div>')
     if stock_bt:
         blocks.append(
             '<div class="card"><h2>A股策略回测净值（最新一份 · 本机组合账户口径）</h2>'
