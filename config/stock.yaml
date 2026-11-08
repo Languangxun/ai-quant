@@ -73,7 +73,7 @@ stock:
     block_hurt_sectors: true        # high 时跳过明确受损行业
 
   # 信号/选股（复用 CLI 多维评分 + RISK_PARAMS）
-  risk_mode: 稳健             # 保守 / 稳健 / 激进
+  risk_mode: 激进             # 保守 / 稳健 / 激进 (quant 指定 2026-11-08)
 
   universe:
     min_bars: 400             # 最少K线
