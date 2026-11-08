@@ -17,7 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TAG = sys.argv[1] if len(sys.argv) > 1 else "ablation"
 REGION = sys.argv[2] if len(sys.argv) > 2 else "2026"
 JSON_PATH = (sys.argv[3] if len(sys.argv) > 3
-             else sorted(glob.glob("/home/lan/ai-quant/logs/ablation-*.json"),
+             else sorted(glob.glob("/home/lan/ai-quant/logs/ablation-*.json")
+                         + glob.glob(os.path.dirname(os.path.abspath(__file__))
+                                     + "/../logs/ablation-*.json"),
                          key=os.path.getmtime, reverse=True)[0])
 print(f"[exp-ablation] picks={JSON_PATH} region={REGION}", flush=True)
 
@@ -75,8 +77,14 @@ def signal_fn(rows, code):
                     else cli._sig_analog(rows, code))
         else:
             fn = getattr(cli, f"_sig_{key}")
-            sigs = fn(rows, industry=(_industry(code)
-                                      if key in ("sector_rot",) else None))
+            if key in ("sector_rot", "l1_pattern", "l2_industry"):
+                import inspect as _insp
+                kw = {}
+                if "industry" in _insp.signature(fn).parameters:
+                    kw["industry"] = _industry(code)
+                sigs = fn(rows, **kw)
+            else:
+                sigs = fn(rows)
         return sigs or []
     except Exception as e:
         print(f"[exp-ablation] {code} {label} 生成失败 {type(e).__name__}: {e}",
