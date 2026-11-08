@@ -20,7 +20,7 @@ import subprocess
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, quote as urlquote
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_DIR = os.path.join(BASE_DIR, "sim", "state")
@@ -922,12 +922,20 @@ def stock_account():
     data = read_json(path, {})
     if not data:
         return None
+    lots = []
+    for code, arr in (data.get("lots") or {}).items():
+        for lot in (arr if isinstance(arr, list) else [arr]):
+            if isinstance(lot, dict):
+                lots.append({"code": code, "shares": lot.get("shares"),
+                             "cost": lot.get("cost"),
+                             "buy_date": lot.get("buy_date", "")})
     return {
         "cash": fmt_money(data.get("cash", 0)),
         "total_asset": fmt_money(data.get("total_asset", 0)),
-        "positions": len(data.get("positions", {})),
+        "positions": len(data.get("positions") or lots),
         "trade_count": data.get("trade_count", 0),
         "date": data.get("date", "-"),
+        "lots": lots,
     }
 
 
@@ -1433,6 +1441,235 @@ def pi_status_html(snap=None):
             + "<div class='card'><h2>Pi 最近日志</h2>" + lhtml + "</div>")
 
 
+
+# ============== 回测/模拟盘净值曲线（/quant 图表） ==============
+
+_MARKET_LABEL = {"fund": "基金", "hk": "港股", "us": "美股",
+                 "crypto": "加密", "fut": "期货"}
+
+
+def _normalize_curve(points):
+    """[(date, value)] -> 归一化净值序列（起点=1.0）。"""
+    if not points:
+        return []
+    try:
+        base = float(points[0][1]) or 1.0
+    except (TypeError, ValueError, IndexError):
+        return []
+    out = []
+    for p in points:
+        try:
+            out.append((str(p[0]), round(float(p[1]) / base, 4)))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def multi_backtest_curves():
+    """各市场回测净值曲线（backtest/results/multi-<market>-*.json 最新一份）。"""
+    out = {}
+    for m in ("fund", "hk", "us", "crypto", "fut"):
+        files = sorted(glob.glob(os.path.join(
+            BACKTEST_DIR, f"multi-{m}-*.json")),
+            key=os.path.getmtime, reverse=True)
+        for f in files:
+            d = read_json(f)
+            eq = (d or {}).get("equity") if isinstance(d, dict) else None
+            norm = _normalize_curve(eq or [])
+            if len(norm) >= 5:
+                out[m] = {"label": _MARKET_LABEL.get(m, m),
+                          "file": os.path.basename(f),
+                          "curve": norm}
+                break
+    return out
+
+
+def latest_stock_backtest():
+    """最新 A 股策略回测：策略/等权/上证 三条归一化曲线。"""
+    files = sorted(glob.glob(os.path.join(
+        BACKTEST_DIR, "stock_backtest_*.json")),
+        key=os.path.getmtime, reverse=True)
+    for f in files:
+        d = read_json(f)
+        if not isinstance(d, dict) or not d.get("equity"):
+            continue
+        eq = _normalize_curve(d.get("equity") or [])
+        if len(eq) < 5:
+            continue
+        return {"file": os.path.basename(f),
+                "equity": eq,
+                "bench": _normalize_curve(d.get("bench_curve") or []),
+                "index": _normalize_curve(d.get("index_curve") or [])}
+    return None
+
+
+def stock_daily_curve():
+    """A 股模拟盘每日净值（memory/daily/stock-*.json 的账户快照）。"""
+    pts = []
+    for f in sorted(glob.glob(os.path.join(
+            BASE_DIR, "memory", "daily", "stock-*.json"))):
+        d = read_json(f)
+        if not isinstance(d, dict):
+            continue
+        acc = d.get("account") or {}
+        for s in reversed(d.get("sessions") or []):
+            if isinstance(s, dict) and (s.get("account") or {}).get("total_asset"):
+                acc = s["account"]
+                break
+        total = acc.get("total_asset")
+        if total:
+            pts.append((str(d.get("date") or os.path.basename(f)[6:16]),
+                        float(total)))
+    return _normalize_curve(pts)
+
+
+EQUITY_JS = """
+function drawEquity(canvasId, seriesList, opts){
+  var c = document.getElementById(canvasId);
+  if(!c) return;
+  var dpr = window.devicePixelRatio || 1;
+  var cssW = c.clientWidth || 1100, cssH = opts.height || 340;
+  c.width = cssW * dpr; c.height = cssH * dpr;
+  c.style.height = cssH + 'px';
+  var ctx = c.getContext('2d');
+  ctx.scale(dpr, dpr);
+  var pad = {left:56, right:18, top:26, bottom:28};
+  var W = cssW, H = cssH;
+  var chartW = W - pad.left - pad.right, chartH = H - pad.top - pad.bottom;
+  var bg = getComputedStyle(document.body).getPropertyValue('--bg').trim() || '#0b0e11';
+  ctx.fillStyle = bg; ctx.fillRect(0,0,W,H);
+  var n = 0;
+  seriesList.forEach(function(s){ n = Math.max(n, (s.points||[]).length); });
+  if(!n) return;
+  var min = Infinity, max = -Infinity;
+  seriesList.forEach(function(s){
+    (s.points||[]).forEach(function(p){
+      var v = p[1];
+      if(v < min) min = v;
+      if(v > max) max = v;
+    });
+  });
+  if(min === max){ min -= 0.01; max += 0.01; }
+  var padV = (max - min) * 0.08;
+  min -= padV; max += padV;
+  function x(i){ return pad.left + (n <= 1 ? 0 : i / (n - 1) * chartW); }
+  function y(v){ return pad.top + (max - v) / (max - min) * chartH; }
+  // 网格
+  ctx.strokeStyle = '#21262d'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for(var i=0;i<=4;i++){
+    var gy = pad.top + chartH * i / 4;
+    ctx.moveTo(pad.left, gy); ctx.lineTo(W-pad.right, gy);
+  }
+  ctx.stroke();
+  ctx.fillStyle = '#8b949e'; ctx.font = '10px monospace'; ctx.textAlign = 'left';
+  for(var i=0;i<=4;i++){
+    var gy = pad.top + chartH * i / 4;
+    var gv = max - (max-min) * i / 4;
+    ctx.fillText(gv.toFixed(3), 4, gy + 3);
+  }
+  // 曲线
+  var colors = opts.colors || ['#3fb950','#58a6ff','#f0883e','#a371f7','#f85149'];
+  seriesList.forEach(function(s, si){
+    var pts = s.points || [];
+    if(pts.length < 2) return;
+    ctx.strokeStyle = colors[si % colors.length];
+    ctx.lineWidth = 1.6; ctx.beginPath();
+    var started = false;
+    for(var i=0;i<pts.length;i++){
+      var px = x(i), py = y(pts[i][1]);
+      if(!started){ ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+  });
+  // 日期轴
+  var first = (seriesList[0].points || []);
+  var lastPts = first;
+  if(lastPts.length){
+    ctx.fillStyle = '#8b949e'; ctx.font = '10px sans-serif'; ctx.textAlign = 'left';
+    var ticks = [0, Math.floor((lastPts.length-1)/2), lastPts.length-1];
+    var seenX = {};
+    ticks.forEach(function(i){
+      var px = x(i);
+      if(seenX[Math.round(px)]) return; seenX[Math.round(px)] = 1;
+      ctx.fillText(String(lastPts[i][0]).slice(5), px-16, H-8);
+    });
+  }
+  // 图例
+  var lx = pad.left + 4, ly = pad.top - 10;
+  ctx.font = '11px sans-serif'; ctx.textAlign = 'left';
+  seriesList.forEach(function(s, si){
+    ctx.fillStyle = colors[si % colors.length];
+    ctx.fillRect(lx, ly-8, 10, 3);
+    ctx.fillStyle = '#8b949e';
+    ctx.fillText(s.label, lx+15, ly-2);
+    lx += ctx.measureText(s.label).width + 38;
+  });
+  // 末值标签
+  seriesList.forEach(function(s, si){
+    var pts = s.points || [];
+    if(!pts.length) return;
+    ctx.fillStyle = colors[si % colors.length];
+    ctx.font = '11px monospace';
+    ctx.fillText(pts[pts.length-1][1].toFixed(3), W-pad.right-52, y(pts[pts.length-1][1]) - 6 + si*13);
+  });
+}
+"""
+
+
+def equity_charts_html():
+    """回测/模拟盘净值图表卡片。"""
+    import json as _json
+    multi = multi_backtest_curves()
+    stock_bt = latest_stock_backtest()
+    stock_sim = stock_daily_curve()
+    blocks = []
+    if multi:
+        series = [{"label": v["label"], "points": v["curve"]}
+                  for v in multi.values()]
+        blocks.append(
+            '<div class="card"><h2>各市场回测净值（归一化）</h2>'
+            '<canvas id="eqMulti" style="width:100%;display:block"></canvas>'
+            '<div class="meta" style="margin-top:8px">'
+            + "；".join(f'{v["label"]}: {v["file"]}' for v in multi.values())
+            + "</div></div>")
+    if stock_bt:
+        series = [{"label": "策略", "points": stock_bt["equity"]}]
+        if stock_bt["bench"]:
+            series.append({"label": "等权基准", "points": stock_bt["bench"]})
+        if stock_bt["index"]:
+            series.append({"label": "上证指数", "points": stock_bt["index"]})
+        blocks.append(
+            '<div class="card"><h2>A股策略回测净值（最新一份）</h2>'
+            '<canvas id="eqStockBt" style="width:100%;display:block"></canvas>'
+            '<div class="meta" style="margin-top:8px">文件：'
+            + stock_bt["file"] + "</div></div>")
+    if len(stock_sim) >= 2:
+        blocks.append(
+            '<div class="card"><h2>A股模拟盘每日净值（真实跑盘快照）</h2>'
+            '<canvas id="eqStockSim" style="width:100%;display:block"></canvas>'
+            "</div>")
+    if not blocks:
+        return ""
+    data_js = []
+    if multi:
+        data_js.append(("eqMulti", [{"label": v["label"], "points": v["curve"]}
+                                    for v in multi.values()]))
+    if stock_bt:
+        ss = [{"label": "策略", "points": stock_bt["equity"]}]
+        if stock_bt["bench"]:
+            ss.append({"label": "等权基准", "points": stock_bt["bench"]})
+        if stock_bt["index"]:
+            ss.append({"label": "上证指数", "points": stock_bt["index"]})
+        data_js.append(("eqStockBt", ss))
+    if len(stock_sim) >= 2:
+        data_js.append(("eqStockSim", [{"label": "模拟盘", "points": stock_sim}]))
+    js_calls = "".join(
+        f"drawEquity({_json.dumps(cid)}, {_json.dumps(series, ensure_ascii=False)}, {{height:320}});"
+        for cid, series in data_js)
+    return ("".join(blocks) + "<script>" + EQUITY_JS + js_calls + "</script>")
+
+
 def quant_page():
     machine = machine_status()
     services = service_status()
@@ -1470,8 +1707,11 @@ def quant_page():
         for lot in info.get("lots", []):
             if not isinstance(lot, dict):
                 continue
+            _lc = str(lot.get("code") or "")
+            _lurl = "/quote?code=" + urlquote(_lc, safe="")
             lots_rows.append(
-                f"<tr><td>{lot.get('code','')}</td><td>{lot.get('shares','')}</td>"
+                f"<tr><td><a href='{_lurl}' style='color:var(--accent);text-decoration:none'>{_lc}</a></td>"
+                f"<td>{lot.get('shares','')}</td>"
                 f"<td>{fmt_money(lot.get('cost',''))}</td><td>{fmt_money(lot.get('price','-'))}</td>"
                 f"<td>{lot.get('buy_date','')}</td><td>{lot.get('reason','')[:50]}</td></tr>"
             )
@@ -1494,11 +1734,24 @@ def quant_page():
         stock["成交(累计)"] = stock.pop("trade_count", stock.get("成交(累计)", "-"))
     except OSError:
         pass
+    stock_lots = (stock or {}).get("lots") or []
+    stock_rows = {k: v for k, v in (stock or {}).items() if k != "lots"}
     stock_html = "<p>无状态文件</p>" if not stock else (
-        "".join(f"<tr><td><strong>{k}</strong></td><td>{v}</td></tr>" for k, v in stock.items())
+        "".join(f"<tr><td><strong>{k}</strong></td><td>{v}</td></tr>"
+                for k, v in stock_rows.items())
     )
     if stock:
         stock_html = "<table>" + stock_html + "</table>"
+    if stock_lots:
+        srows = "".join(
+            f"<tr><td><a href='/quote?code={urlquote(str(l.get('code') or ''), safe='')}' "
+            f"style='color:var(--accent);text-decoration:none'>{l.get('code')}</a></td>"
+            f"<td>{l.get('shares')}</td><td>{fmt_money(l.get('cost'))}</td>"
+            f"<td>{l.get('buy_date','')}</td></tr>"
+            for l in stock_lots)
+        stock_html += ("<h3 style='margin-top:14px'>当前持仓</h3>"
+                       "<table><tr><th>代码</th><th>股数</th><th>成本</th><th>买入日</th></tr>"
+                       + srows + "</table>")
 
     backtest_html = ""
     for bt in backtests:
@@ -1523,6 +1776,8 @@ def quant_page():
     <div class="meta">{HOST_LABEL} | 公网: <a href="https://quant.tail6a6cc8.ts.net/">https://quant.tail6a6cc8.ts.net/</a></div>
 
     <div class="card"><h2>服务状态</h2><p>{service_badge}</p></div>
+
+    {equity_charts_html()}
 
     <div class="grid">
         <div class="card"><h2>系统状态</h2><table>{machine_rows}</table></div>
