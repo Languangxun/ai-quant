@@ -48,10 +48,10 @@ stock:
 
   # 交易费用（A股）
   fees:
-    commission_rate: 0.00025  # 佣金 万2.5
+    commission_rate: 0.0005   # 佣金 万5
     min_commission: 5.0       # 最低 5 元
-    stamp_tax_rate: 0.0005    # 印花税 0.05%（仅卖出）
-    transfer_fee_rate: 0.00001  # 过户费 0.001%
+    stamp_tax_rate: 0.0005    # 印花税 0.05%（卖出单边，2023-08-28 现行口径）
+    transfer_fee_rate: 0.00001  # 过户费 0.001% 双向（万0.1，2022-04-29 下调后现行）
 
   # 成交口径：信号 T 日收盘生成，T+1 成交（close=收盘价，open=开盘价）
   exec_px: close

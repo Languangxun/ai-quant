@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 LOT_SIZE = 100
-COMMISSION_RATE = 2.5e-4
+COMMISSION_RATE = 5e-4
 MIN_COMMISSION = 5.0
 STAMP_TAX_RATE = 5e-4
 TRANSFER_FEE_RATE = 1e-5
