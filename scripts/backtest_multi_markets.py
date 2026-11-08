@@ -144,10 +144,17 @@ def main():
     ap.add_argument("--end", default=None)
     ap.add_argument("--rebalance", type=int, default=5)
     ap.add_argument("--markets", default=",".join(MARKETS))
+    ap.add_argument("--legacy-us", action="store_true",
+                    help="用旧 sm701_universal 重跑美股 (会覆盖 P1 曲线); "
+                         "默认美股由 gen_us_p1_artifacts.py 单独生成")
     args = ap.parse_args()
     items = [m.strip() for m in args.markets.split(",") if m.strip()]
     for m in items:
         print(f"===== {m} =====", flush=True)
+        if m == "us" and not args.legacy_us:
+            print("[us] 跳过: P1 曲线由 scripts/gen_us_p1_artifacts.py "
+                  "生成 (--legacy-us 可强制旧口径)", flush=True)
+            continue
         try:
             _run_market(m, args.start, args.end, args.rebalance)
         except Exception as e:

@@ -5,6 +5,7 @@
 数据源 (与 stock_web.py 同源, 2026-10 实测 Pi 可达):
   HK: 腾讯 proxy.finance.qq.com fqkline (HTTP) (全量 HK 成分, 约 2900 只)
   US: 腾讯 proxy.finance.qq.com fqkline (HTTP) + 东财兜底 (核心池)
+  US P1: --only us_p1 刷新标普500 503只前复权最近500根 -> us_daily_qfq
   加密: Gate 现货日K (CRYPTO 全 20 只, 秒级)
   期货: 国内主力连续 82 品种 (FUT)。桌面优先读 sm701 副本库 fut_daily
         (SM701_DB 可覆盖, 与 sm701 生产模型训练数据同源); 缺库时回落
@@ -152,6 +153,77 @@ def _crypto_bars(code):
         except (ValueError, IndexError):
             continue
     return sorted(out)
+
+
+US_P1_TABLE = "us_daily_qfq"
+US_P1_TICKERS = os.path.join(BASE, "data", "us_sp500.txt")
+US_P1_DDL = (f"CREATE TABLE IF NOT EXISTS {US_P1_TABLE}("
+             "code TEXT NOT NULL, date TEXT NOT NULL, open REAL, high REAL, "
+             "low REAL, close REAL, vol REAL, PRIMARY KEY(code,date))")
+
+
+def _us_p1_tickers():
+    out = []
+    try:
+        with open(US_P1_TICKERS, encoding="utf-8") as f:
+            for line in f:
+                c = line.strip()
+                if c and not c.startswith("#"):
+                    out.append(c)
+    except OSError:
+        pass
+    return out
+
+
+def _us_p1_bars(symbol):
+    """腾讯 qfq 500 根优先; 失败再走多后缀/东财兜底."""
+    for sym in (symbol, symbol.replace("-", ".")):
+        try:
+            out = _tencent_bars("us" + sym)
+            if len(out) >= 20:
+                return sorted(out)
+        except Exception:
+            pass
+    return _us_bars(symbol)
+
+
+def sync_us_p1(con, workers=4):
+    """美股 P1 qfq 增量: 每次替换每只最近 500 根, 避免前复权因子漂移."""
+    con.execute(US_P1_DDL)
+    codes = _us_p1_tickers()
+    if not codes:
+        print(f"  US_P1: 缺清单 {US_P1_TICKERS}", flush=True)
+        return 0
+    print(f"  US_P1: {len(codes)} 只标普500 qfq (workers={workers})",
+          flush=True)
+    n = 0
+    workers = max(1, int(workers))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_us_p1_bars, c): c for c in codes}
+        for i, fut in enumerate(as_completed(futs), 1):
+            c = futs[fut]
+            try:
+                rows = fut.result()
+            except Exception as e:
+                print(f"  US_P1 {c} 跳过: {str(e)[:80]}", flush=True)
+                continue
+            if not rows:
+                continue
+            rows = sorted(rows)
+            first = rows[0][0]
+            con.execute(f"DELETE FROM {US_P1_TABLE} WHERE code=? AND date>=?",
+                        (c, first))
+            con.executemany(
+                f"INSERT OR REPLACE INTO {US_P1_TABLE}"
+                "(code,date,open,high,low,close,vol) VALUES(?,?,?,?,?,?,?)",
+                [(c,) + tuple(r) for r in rows])
+            n += len(rows)
+            if i % 50 == 0:
+                con.commit()
+                print(f"  US_P1 {i}/{len(codes)} +{n}", flush=True)
+    con.commit()
+    print(f"US_P1 刷新 {n} 根", flush=True)
+    return n
 
 
 def _upsert(con, market, code, rows):
@@ -339,6 +411,8 @@ def main(argv=None):
             con.commit()
             print(f"HK 新增 {n} 根")
             total += n
+        if "us_p1" in only:
+            total += sync_us_p1(con, workers=max(1, int(a.workers)))
         if "us" in only:
             n = 0
             majors = _majors()

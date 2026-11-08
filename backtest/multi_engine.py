@@ -40,6 +40,8 @@ def _universe(market, limit=0):
         return u[:limit] if limit else u
     from data import unified as u
     from data.universe_filter import liquid_top
+    if market == "us" and u.has_us_p1():
+        return u.us_p1_universe()
     all_u = u.universe(market)
     if not all_u:
         return []
@@ -55,6 +57,8 @@ def _bars(market, mcode, tail=None):
         from data.fund import bars as fb
         return fb.get_bars(mcode, tail=tail)
     from data import unified as u
+    if market == "us" and u.has_us_p1():
+        return u.get_us_p1_bars(mcode, tail=tail)
     return u.get_bars(mcode, tail=tail)
 
 
@@ -108,6 +112,14 @@ def run(market="hk", limit=None, topk=None, threshold=None, start="", end="",
     # 质量门槛与选股一致 (hk/us 120根; 脏数据已在 _universe 剔除, 此处双保险)
     from data.universe_filter import MIN_BARS as _MINB
     need = int(_MINB.get(market, 65))
+    us_p1 = False
+    try:
+        from data import unified as _u
+        us_p1 = market == "us" and _u.has_us_p1()
+        if us_p1:
+            need = 260  # P1 长周期特征 warmup
+    except Exception:
+        us_p1 = False
     bars_map, name_map = {}, {}
     for mcode, name in uni:
         try:
@@ -120,9 +132,12 @@ def run(market="hk", limit=None, topk=None, threshold=None, start="", end="",
     if not bars_map:
         raise SystemExit(f"[{market}] 有效K线不足{need}根")
     dates = _trade_dates(market, start, end)
-    # 信号需65根预热: 起点截到最早可算日
-    min_d = min(b.date for bs in bars_map.values() for b in bs[64:65])
-    dates = [d for d in dates if d >= min_d]
+    # 信号需 need 根预热: 起点截到最早可算日
+    i0 = max(0, need - 1)
+    min_d = min(b.date for bs in bars_map.values()
+                for b in bs[i0:i0 + 1]) if bars_map else ""
+    if min_d:
+        dates = [d for d in dates if d >= min_d]
     if start:
         dates = [d for d in dates if d >= start]
     progress(f"[{market}] 回测 {dates[0]}~{dates[-1]} ({len(dates)}日)")
@@ -145,11 +160,12 @@ def run(market="hk", limit=None, topk=None, threshold=None, start="", end="",
             progress(f"  {di}/{len(dates)} {day} 持仓{len(acc.position_codes())}")
         # T日截面 bars (<=day, 尾200根加速特征)
         snap = {}
+        lookback = 340 if us_p1 else 200
         for c, bs in bars_map.items():
             k = idx[c].get(day)
-            if k is None or k < 64:
+            if k is None or k < need - 1:
                 continue
-            snap[c] = bs[max(0, k - 199):k + 1]
+            snap[c] = bs[max(0, k - (lookback - 1)):k + 1]
         sigs = []
         if snap:
             try:

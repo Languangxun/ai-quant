@@ -28,7 +28,7 @@ def _markets_cfg():
         return {}
 
 
-def _universe(market, limit):
+def _universe(market, limit, force=False):
     if market == "fund":
         from data.fund import bars as fb
         return fb.universe()
@@ -36,7 +36,7 @@ def _universe(market, limit):
     from data.universe_filter import liquid_top
     all_u = u.universe(market)
     # 非交易日闸门：加密 7x24 直跑，其余市场周末/节假日不产生交易/状态写入
-    if market != "crypto":
+    if market != "crypto" and not force:
         try:
             from trading.calendar import TradingCalendar as _TC
             import datetime as _dt
@@ -45,6 +45,13 @@ def _universe(market, limit):
                 return {"market": market, "skipped": "non-trading-day"}
         except Exception:
             pass
+    # 美股 P1: 优先用桌面推送的信号清单 (标普500), 其次 qfq 全量
+    if market == "us":
+        codes = _us_p1_signal_codes()
+        if codes:
+            return [(c, c.split(":", 1)[-1]) for c in codes]
+        if u.has_us_p1():
+            return u.us_p1_universe()
     if market == "crypto":
         return liquid_top(market, all_u,
                           lambda c, tail=150: u.get_bars(c, tail=tail),
@@ -59,7 +66,22 @@ def _bars(market, mcode, tail=200):
         from data.fund import bars as fb
         return fb.get_bars(mcode, tail=tail)
     from data import unified as u
+    if market == "us" and u.has_us_p1():
+        # P1 需 250 日长周期 warmup, 实盘统一取 340 根
+        return u.get_us_p1_bars(mcode, tail=max(tail or 0, 340))
     return u.get_bars(mcode, tail=tail)
+
+
+def _snap_tail(market):
+    """P1 美股需 340 根; 其余保持 200 (与原回测/实盘同口径)."""
+    if market == "us":
+        try:
+            from data import unified as u
+            if u.has_us_p1():
+                return 340
+        except Exception:
+            pass
+    return 200
 
 
 def _load_state(market, capital, fees):
@@ -134,7 +156,98 @@ def _sm702_crypto_signals(topk=3, threshold=0.55, date_limit=None):
     return out[:max(1, int(topk))]
 
 
-def run_one(market, top=5, limit=200, dry_run=False, threshold=None):
+def _us_p1_signal_path():
+    return os.path.join(BASE_DIR, "logs", "us_p1_signal.csv")
+
+
+def _us_p1_signal_codes():
+    """信号 CSV 里的 us:CODE 列表 (供 _universe 覆盖, 缺文件返回 [])."""
+    p = _us_p1_signal_path()
+    if not os.path.exists(p):
+        return []
+    out = []
+    try:
+        import csv as _csv
+        with open(p, encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                c = (row.get("code") or "").strip()
+                if c.startswith("us:"):
+                    out.append(c)
+    except Exception:
+        return []
+    return out
+
+
+def _us_p1_signal_date():
+    p = _us_p1_signal_path()
+    if not os.path.exists(p):
+        return ""
+    newest = ""
+    try:
+        import csv as _csv
+        with open(p, encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                d = row.get("date") or ""
+                if d > newest:
+                    newest = d
+    except Exception:
+        return ""
+    return newest
+
+
+def _us_p1_signals(topk=5, threshold=0.0, date_limit=None):
+    """美股 P1 信号源 (桌面 gen_us_p1_artifacts.py 每日推送).
+
+    读 logs/us_p1_signal.csv; 取最新日 prob TopK.
+    缺失/过旧返回 [] (调用方回退 sm701_universal)."""
+    import csv as _csv
+    from datetime import datetime as _dt, timedelta as _td
+    from core.types import Signal
+    p = _us_p1_signal_path()
+    if not os.path.exists(p):
+        return []
+    newest = None
+    try:
+        with open(p, encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                d = row.get("date") or ""
+                if d and (not newest or d > newest):
+                    newest = d
+    except Exception:
+        return []
+    if not newest:
+        return []
+    try:
+        gdate = _dt.strptime(newest, "%Y-%m-%d").date()
+    except ValueError:
+        return []
+    if _dt.now().date() - gdate > _td(days=5):
+        print(f"[us] us_p1 信号过旧({newest})，回退 sm701", flush=True)
+        return []
+    out = []
+    try:
+        with open(p, encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                if (row.get("date") or "") != newest:
+                    continue
+                prob = float(row.get("prob") or 0)
+                if prob < threshold:
+                    continue
+                code = (row.get("code") or "").strip()
+                if not code.startswith("us:"):
+                    code = "us:" + code
+                out.append((prob, Signal(
+                    code=code, action="BUY", score=round(prob * 100, 1),
+                    reason=f"us_p1 P={prob:.4f}", signal_date=newest)))
+    except Exception as e:
+        print(f"[us] us_p1 信号读取失败 {type(e).__name__}: {e}", flush=True)
+        return []
+    out.sort(key=lambda t: -t[0])
+    return [s for _, s in out[:max(1, int(topk))]]
+
+
+def run_one(market, top=5, limit=200, dry_run=False, threshold=None,
+            force=False):
     from strategies import builtin as _b  # noqa: 注册策略
     from strategies import registry
     from trading.instruments import MarketModel
@@ -153,7 +266,9 @@ def run_one(market, top=5, limit=200, dry_run=False, threshold=None):
     # limit 未给时读 yaml max_scan (fut 0=全扫), 兜底 200
     if not limit:
         limit = int(mcfg.get("max_scan") or 0) or 200
-    uni = _universe(market, limit)
+    uni = _universe(market, limit, force=force)
+    if isinstance(uni, dict):
+        return uni
     print(f"[{market}] 候选 {len(uni)} 只 thr={thr} top={max_pos}")
     bars_map, names = {}, {}
     for mcode, name in uni:
@@ -169,9 +284,27 @@ def run_one(market, top=5, limit=200, dry_run=False, threshold=None):
         return {"market": market, "empty": True}
     strat = registry.get("sm701_universal")
     today = max(b[-1].date for b in bars_map.values())
-    snap = {c: bs[-200:] for c, bs in bars_map.items()}
-    sigs = strat.generate(snap, {"date": today, "threshold": thr,
-                                 "topk": max_pos})
+    snap = {c: bs[-_snap_tail(market):] for c, bs in bars_map.items()}
+    sigs = []
+    if market == "us":
+        try:
+            sd = _us_p1_signal_date()
+            p1 = _us_p1_signals(topk=max_pos, threshold=float(thr or 0.0),
+                                date_limit=today)
+            # 仅当桌面信号日期与本地行情同日才用 CSV (桌面全历史特征);
+            # 否则用本地 qfq + 2026 折模型实时重算, 避免用旧信号配新价.
+            if p1 and sd == today:
+                print(f"[us] us_p1 信号 {len(p1)} 只覆盖（桌面推送 {sd}）",
+                      flush=True)
+                sigs = p1
+            elif p1:
+                print(f"[us] 桌面信号 {sd} != 行情 {today}, 本地模型重算",
+                      flush=True)
+        except Exception as _e:
+            print(f"[us] us_p1 信号失败 {_e}", flush=True)
+    if not sigs:
+        sigs = strat.generate(snap, {"date": today, "threshold": thr,
+                                     "topk": max_pos})
     if market == "crypto":
         try:
             override = _sm702_crypto_signals(topk=max_pos, threshold=thr,
@@ -182,7 +315,8 @@ def run_one(market, top=5, limit=200, dry_run=False, threshold=None):
         except Exception as _e:
             print(f"[crypto] sm702 信号失败 {_e}", flush=True)
     want = [s for s in sigs[:max_pos]]
-    _fmt = (lambda v: f"{v:.3f}") if market == "crypto" else (lambda v: f"{v:.0f}")
+    _fmt = (lambda v: f"{v:.3f}") if market == "crypto" else (
+        (lambda v: f"{v:.2f}") if market == "us" else (lambda v: f"{v:.0f}"))
     print(f"[{market}] {today} 信号 {len(sigs)} Top{max_pos}: " +
           ", ".join(f"{s.code} {_fmt(s.score)}" for s in want))
     acc, path = _load_state(market, capital, fees)
@@ -258,8 +392,12 @@ def run_one(market, top=5, limit=200, dry_run=False, threshold=None):
           f"成交 {len(done)} 笔")
     if not dry_run:
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        state = acc.to_state()
+        # 状态页 market_account 优先读 total_asset; to_state 本身不含,
+        # 补上当日估值, 否则持仓时网站会把现金误当总资产.
+        state["total_asset"] = snap_out["total_asset"]
         with open(path + ".tmp", "w", encoding="utf-8") as f:
-            json.dump(acc.to_state(), f, ensure_ascii=False)
+            json.dump(state, f, ensure_ascii=False)
         os.replace(path + ".tmp", path)
         daily = os.path.join(BASE_DIR, "memory", "daily",
                              f"multi-{market}-{today}.json")
@@ -283,13 +421,16 @@ def main(argv=None):
                     help="缺省读 markets.yaml max_scan (兜底200)")
     ap.add_argument("--threshold", type=float, default=None)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true",
+                    help="非交易日也强制跑 (手动补跑/测试用)")
     a = ap.parse_args(argv)
     mkts = (["fund", "hk", "us", "crypto", "fut"]
             if a.market == "all" else [a.market])
     out = []
     for m in mkts:
         out.append(run_one(m, top=a.top or None, limit=a.limit,
-                           dry_run=a.dry_run, threshold=a.threshold))
+                           dry_run=a.dry_run, threshold=a.threshold,
+                           force=a.force))
     return out
 
 

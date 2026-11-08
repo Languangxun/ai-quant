@@ -147,22 +147,32 @@ VALIDATED → FILLED / REJECTED / NO_CHANGE）。
 **sm701 自动识别市场**：信号层按代码前缀（hk:/us:/fut:/crypto:/fund:）
 分市场选模型——
 
-- **hk/us/fut 默认 sm701**：优先 production 分市场三周期模型
-  （`prod_{hk|us|fut}_h{1,5,10}_tech.txt`，40 维 tech 特征，三周期等权，
-  与桌面 stock_predict v7 实时复算同口径）；模型缺失自动回退 44 维单模型。
-  模型目录：`vendors/sm701/production/`（Pi）或 `~/桌面/sm701/production/`（桌面）。
+- **us 优先美股 P1（2026-11 上线）**：标普500 503 只、`us_daily_qfq`
+  前复权、48 维 full 特征（收益波动率 + 美元成交额 + 120/250 日长周期），
+  walk-forward 2026 折 `us_p1_full_h60_test2026.txt`，Top5 周度调仓。
+  P1 概率≈「跑赢当日截面中位数」，绝对值 0.49–0.52，**不能沿用 0.55 阈值**，
+  `config/markets.yaml` 设 `threshold: 0.0`，由 TopK 排序选股。
+  数据表 `us_daily_qfq` 由 `scripts/sync_global_daily.py --only us_p1`
+  每日刷新最近 500 根（前复权因子漂移自动覆盖）；模型缺失时回退旧的
+  production 三周期 / 44 维单模型。
+- **hk/fut 默认 sm701 production**：`prod_{hk|fut}_h{1,5,10}_tech.txt`
+  （40 维 tech，三周期等权，与桌面 stock_predict v7 同口径）。
 - cn/fund/crypto 走 44 维单模型（A股口径保持可比，fund/crypto 为域外推暂代）。
 - 阈值按市场分别配在 `config/markets.yaml`（`sm701.threshold`，默认 fund
-  0.52 / 其余 0.55）。
+  0.52 / hk/fut/crypto 0.55 / us 0.0）。
 
 ```bash
 python3 -m sim.multi_run --market fut --dry-run      # 试跑（fut=国内期货82主力连续）
+python3 -m sim.multi_run --market us --dry-run --force  # 美股 P1 (非交易日补跑)
 python3 -m sim.multi_run --market all                # fund+hk+us+crypto+fut
 python3 -m backtest.multi_engine --market fut --min-hold 2
+python3 scripts/gen_us_p1_artifacts.py               # 美股 P1 曲线/信号 (桌面 sm701)
 ```
 
 - 数据：港/美/加密/期货日K 在 `data/global_daily.db`（增量
   `scripts/sync_global_daily.py`，期货自 sm701 副本库同源同步）。
+  美股 P1 另用 `data/global_daily.db:us_daily_qfq`（`--only us_p1`），
+  不覆盖原有未复权 US 日K（P1 的美元成交额需要未复权 close join）。
 - 期货口径：T+0、仅佣金、涨跌停/保证金/合约乘数未建模（现金全额记账，
   高价品种单笔额度不足一手时跳过）；编码 `fut:RB0`，与 sm701 fut_daily
   主力连续同源。

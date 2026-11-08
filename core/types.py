@@ -10,7 +10,10 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class Bar:
-    """单根日K (后复权口径, 与 cli_bridge.db_rows 同字段)."""
+    """单根日K (后复权口径, 与 cli_bridge.db_rows 同字段).
+
+    raw_close: 未复权收盘价 (仅美股 P1 美元成交额特征用; 其余市场为 0).
+    """
     code: str
     date: str  # YYYY-MM-DD
     open: float = 0.0
@@ -18,6 +21,7 @@ class Bar:
     low: float = 0.0
     close: float = 0.0
     vol: float = 0.0
+    raw_close: float = 0.0
 
 
 @dataclass(frozen=True)

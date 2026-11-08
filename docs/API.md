@@ -129,6 +129,11 @@ bars = u.get_bars("fut:RB0", tail=250)
 for m in ["cn", "hk", "us", "crypto", "fut"]:
     print(len(u.universe(m)))              # [(code, name), ...]
 print(u.counts())                          # 各市场标的数/记录数/时间范围
+
+# 美股 P1 专用 (前复权 + 未复权 raw_close):
+u.has_us_p1()                              # 是否已导入 us_daily_qfq
+bars = u.get_us_p1_bars("us:AAPL", tail=340)
+print(u.us_p1_universe()[:3])              # 标普500 当前成分
 ```
 
 ### 库结构

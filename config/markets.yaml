@@ -24,7 +24,7 @@ markets:
     max_scan: 200           # 实盘按成交额/市值取前N (Pi省时)
     fees: {commission_rate: 0.0003, min_commission: 3.0, stamp_tax_rate: 0.001, transfer_fee_rate: 0.00002}
     sm701: {threshold: 0.55, min_bars: 65}
-  us:    # 美股 (us:AAPL, T+0, 1股起)
+  us:    # 美股 (us:AAPL, T+0, 1股起) — 2026-11 P1: 标普500 + qfq 48维
     enabled: true
     capital: 20000
     max_positions: 5
@@ -33,9 +33,11 @@ markets:
     min_order_pct: 5.0
     min_hold: 5
     max_hold: 20
-    max_scan: 200
+    max_scan: 0              # P1 全标普500 (503只), 不做 liquid_top 截断
     fees: {commission_rate: 0.0002, min_commission: 1.0, stamp_tax_rate: 0.0, transfer_fee_rate: 0.0}
-    sm701: {threshold: 0.55, min_bars: 65}
+    # P1 概率≈跑赢截面中位数, 绝对值 0.49–0.52, 不能沿用 0.55 阈值;
+    # 0.0 = 全量候选交 TopK 排序 (与 P1 回测/实盘同口径).
+    sm701: {threshold: 0.0, min_bars: 260, model: us_p1}
   crypto:  # 加密 (crypto:BTC/USDT, 7x24, 仅佣金, 小数份额)
     enabled: true
     capital: 10000

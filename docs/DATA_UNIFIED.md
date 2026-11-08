@@ -8,7 +8,7 @@
 |---|---|---|
 | A股 | `sh600000`（裸码，兼容 cli_bridge） | `scripts/cli/stock_cache.db`（12.7M 根） |
 | 港股 | `hk:00700` | `data/global_daily.db`（sniper 快照，2.4M 根） |
-| 美股 | `us:AAPL` | 同上（6.4M 根） |
+| 美股 | `us:AAPL` | 同上（6.4M 根，未复权）；P1 另表 `us_daily_qfq`（1.8M 根/503 只，前复权） |
 | 加密 | `crypto:BTC/USDT`（sniper 原生 `/`） | 同上（5 万根） |
 | 期货 | `fut:RB0`（国内主力连续 82 品种，sm701 fut_daily 同源） | 同上（19.6 万根，2010 起） |
 
@@ -26,6 +26,9 @@
   `InnerFuturesNewService.getDailyKLine`（全历史日K）；Pi 上 `GLOBAL_DB`
   默认指向 U 盘库。
 - `data/us_majors.yaml`：美股增量核心池（全历史随快照走，增量只追核心）。
+- `--only us_p1`：标普500 503 只前复权日线刷新（腾讯 qfq，每次覆盖每只最近
+  500 根，避免拆股/分红后前复权因子漂移）；写入 `us_daily_qfq`，供美股 P1
+  48 维特征使用，`data/us_sp500.txt` 为当前成分清单。
 - Pi cron：`0 18 * * * .../sync_global_daily.py`（每日盘后）。
 
 ## 网络容错

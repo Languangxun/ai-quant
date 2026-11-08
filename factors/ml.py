@@ -34,6 +34,17 @@ PROD_CANDIDATES = [
     os.path.join(_BASE, "vendors", "sm701", "production"),
     os.path.expanduser("~/桌面/sm701/production"),
 ]
+# 美股 P1 (2026-11-08): qfq + 48 维 full + walk-forward 2026 折模型.
+# 生产目录优先, 桌面研究目录兜底; 仅在 us: 且文件齐备时启用.
+US_P1_CANDIDATES = [
+    os.path.join(_BASE, "vendors", "sm701", "production", "us_p1"),
+    os.path.expanduser("~/桌面/sm701/markets_output"),
+]
+US_P1_MODELS = {
+    "h20": "us_p1_full_h20_test2026.txt",
+    "h60": "us_p1_full_h60_test2026.txt",
+}
+US_P1_HORIZONS = ("h60",)
 # 市场 -> production 模型前缀 (cn 保持 44 维单模型口径, 不切 production)
 PROD_MPRE = {"hk": "hk_", "us": "us_", "fut": "fut_"}
 PROD_HORIZONS = ("1", "5", "10")
@@ -116,6 +127,65 @@ def _prod_set(market):
         out = None
     _prod_cache[key] = out
     return out
+
+
+_us_p1_cache = {}
+
+
+def us_p1_dir():
+    """美股 P1 模型目录; 所需 h60 (h20 可选) 齐备才返回."""
+    need = [US_P1_MODELS["h60"]]
+    for d in US_P1_CANDIDATES:
+        if all(os.path.exists(os.path.join(d, f)) for f in need):
+            return d
+    return ""
+
+
+def _us_p1_set():
+    """懒加载 P1 booster; 不可用缓存 None."""
+    d = us_p1_dir()
+    if not d or not available():
+        return None
+    if d in _us_p1_cache:
+        return _us_p1_cache[d]
+    out = None
+    try:
+        import lightgbm as lgb
+        bs = {}
+        for h, fn in US_P1_MODELS.items():
+            p = os.path.join(d, fn)
+            if os.path.exists(p):
+                bs[h] = lgb.Booster(model_file=p)
+        if "h60" in bs:
+            out = {"dir": d, "boosters": bs,
+                   "feats": list(bs["h60"].feature_name() or [])}
+    except Exception:
+        out = None
+    _us_p1_cache[d] = out
+    return out
+
+
+def us_p1_available():
+    return _us_p1_set() is not None
+
+
+def predict_us_p1(feature_rows, horizons=None):
+    """48 维 P1 特征 -> [P(跑赢截面中位数)].
+
+    默认 h60 2026 折 (walk-forward 最稳); 特征列以模型 feature_name 为准.
+    无模型/无 lightgbm/空输入返回 []."""
+    s = _us_p1_set()
+    if not s or not feature_rows:
+        return []
+    import numpy as np
+    hs = tuple(horizons or US_P1_HORIZONS)
+    feats = s["feats"]
+    X = np.array([[float(r.get(k, np.nan)) for k in feats]
+                  for r in feature_rows], dtype=np.float32)
+    ps = [s["boosters"][h].predict(X) for h in hs if h in s["boosters"]]
+    if not ps:
+        return []
+    return [float(x) for x in sum(ps) / len(ps)]
 
 
 def predict_proba(feature_rows, market="cn"):

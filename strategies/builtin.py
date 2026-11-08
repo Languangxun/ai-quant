@@ -184,10 +184,57 @@ def _market_of(code):
     return "cn"
 
 
+def _us_p1_generate(bars_by_code, thr_map, default_thr, ctx):
+    """美股 P1 专用信号 (48维 qfq full + walk-forward h60).
+
+    P1 概率是「跑赢当日截面中位数」, 绝对值接近 0.49–0.52, 不是校准的
+    0.55 阈值, 因此 config/markets.yaml 的 us.threshold 设 0.0,
+    由 TopK 排序选股 (TopK 不足时才看阈值).
+    """
+    from factors import ml as _ml
+    from factors import us_p1 as _up
+    rows = _up.build_rows(bars_by_code)
+    if not rows:
+        return []
+    codes = list(rows)
+    ps = _ml.predict_us_p1([rows[c] for c in codes])
+    if len(ps) != len(codes):
+        return []
+    try:
+        topk = int(ctx.get("topk", 0) or 0)
+    except Exception:
+        topk = 0
+    fill = bool(ctx.get("fill_below_thr", False))
+    out, below = [], []  # (p, Signal); 用原始 p 排序, 避免 score 四舍五入并列
+    for c, p in zip(codes, ps):
+        d = bars_by_code[c][-1].date
+        thr = (default_thr if default_thr is not None
+               else float(thr_map.get("us", 0.0)))
+        sig = Signal(code=c, action="BUY", score=round(p * 100, 1),
+                     reason=f"us_p1 P={p:.4f}>=thr{thr:.2f}",
+                     signal_date=d)
+        if p >= thr:
+            out.append((p, sig))
+        else:
+            below.append((p, Signal(
+                code=c, action="BUY", score=round(p * 100, 1),
+                reason=f"us_p1 P={p:.4f}<thr{thr:.2f}(TopK补足)",
+                signal_date=d)))
+    out.sort(key=lambda t: -t[0])
+    if fill and topk and len(out) < topk:
+        below.sort(key=lambda t: -t[0])
+        out += below[:topk - len(out)]
+        out.sort(key=lambda t: -t[0])
+    elif topk:
+        out = out[:topk]
+    return [s for _, s in out]
+
+
 @register
 class Sm701Universal(BaseStrategy):
     name = "sm701_universal"
-    description = ("sm701 跨市场复用: cn 44维单模型, hk/us/fut 自动切 production 分市场模型, fund/crypto 暂代")
+    description = ("sm701 跨市场复用: cn 44维单模型, hk/us/fut 自动切 production 分市场模型, "
+                   "us 优先 P1 48维 qfq walk-forward, fund/crypto 暂代")
 
     def generate(self, bars_by_code, ctx=None):
         from factors import ml as _ml
@@ -212,6 +259,12 @@ class Sm701Universal(BaseStrategy):
             pass
         default_thr = ctx.get("threshold", None)
         default_thr = float(default_thr) if default_thr is not None else None
+        # 美股 P1: 仅当整批都是 us: 且 2026 折模型可用时启用;
+        # 混合市场/缺模型自动回退下方通用 44维/production 路径.
+        if (bars_by_code
+                and all(_market_of(c) == "us" for c in bars_by_code)
+                and _ml.us_p1_available()):
+            return _us_p1_generate(bars_by_code, thr_map, default_thr, ctx)
         # 市场环境: 同批 codes 的当日 ret 均值/上涨占比 (mkt/breadth),
         # 横截面 rank (r_*) 按当日值分位; 单只/基金无对手时回退 0/0.5.
         # 按 date 分组算市场均值 (同 date 才可比, 跨市场日历不同天然分组)

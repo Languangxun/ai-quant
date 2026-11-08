@@ -889,15 +889,24 @@ def market_account(market):
         ret = 0.0
 
     lots = []
+    last_px = acct.get("last_prices") or {}
     positions = acct.get("positions") or acct.get("lots") or {}
     if isinstance(positions, dict):
         for code, arr in positions.items():
             if isinstance(arr, list):
                 for lot in arr:
                     if isinstance(lot, dict):
+                        lot = dict(lot)
+                        lot.setdefault("code", code)
+                        if not lot.get("price"):
+                            lot["price"] = last_px.get(code, lot.get("cost"))
                         lots.append(lot)
             elif isinstance(arr, dict):
-                lots.append(arr)
+                lot = dict(arr)
+                lot.setdefault("code", code)
+                if not lot.get("price"):
+                    lot["price"] = last_px.get(code, lot.get("cost"))
+                lots.append(lot)
     mtime = ""
     try:
         mtime = time.strftime("%m-%d %H:%M", time.localtime(
@@ -1646,7 +1655,8 @@ def desktop_dashboard_curves():
 
 
 _ALL_MARKET_LABEL = {"fund": "基金", "hk": "港股", "us": "美股",
-                      "crypto": "加密", "fut": "期货", "cn": "A股"}
+                      "crypto": "加密", "fut": "期货",
+                      "cn": "A股(本机账户)"}
 
 
 def unified_market_comparison():
@@ -1738,7 +1748,10 @@ def equity_charts_html():
             '<canvas id="eqMulti" style="width:100%;display:block"></canvas>'
             '<div class="meta" style="margin-top:8px">各市场原始区间：'
             + raw + "；已统一裁剪到交集区间并以区间起点重新归一化，"
-            '横向可比。A股为本机组合账户回测（非单股事件口径）。</div></div>')
+            '横向可比。美股为 2026-11 P1（标普500/qfq/48维/walk-forward h60/'
+            'Top5 周度调仓）。A股(本机账户)为 ai-quant 组合账户回测'
+            '（5仓/T+1/含费用），不是下方 dashboard 三档的单股事件回测，'
+            '两者口径不同、不应直接比较。</div></div>')
     if stock_bt:
         blocks.append(
             '<div class="card"><h2>A股策略回测净值（最新一份 · 本机组合账户口径）</h2>'
@@ -1821,7 +1834,7 @@ def quant_page():
                      "".join(lots_rows) + "</table>") if lots_rows else "<p>当前无持仓</p>"
         market_cards.append(f"""
         <div class="card">
-            <h3>{m.upper()} 模拟盘<span class="meta" style="font-size:11px;color:var(--muted)"> 状态文件更新 {info.get('state_mtime','-')}（累计口径）</span></h3>
+            <h3>{m.upper()}{' · P1' if m == 'us' else ''} 模拟盘<span class="meta" style="font-size:11px;color:var(--muted)"> 状态文件更新 {info.get('state_mtime','-')}（累计口径）</span></h3>
             <p><strong>初始:</strong> {info['initial']} &nbsp;|&nbsp; <strong>总资产:</strong> {info['total']} &nbsp;|&nbsp;
                <strong>收益:</strong> {info['return']} &nbsp;|&nbsp; <strong>现金:</strong> {info['cash']} &nbsp;|&nbsp;
                <strong>成交(累计):</strong> {info['trade_count']}</p>

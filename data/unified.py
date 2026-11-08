@@ -90,6 +90,75 @@ def _has_g():
         return False
 
 
+US_P1_TABLE = "us_daily_qfq"
+US_P1_TICKERS = os.path.join(BASE_DIR, "data", "us_sp500.txt")
+
+
+def _g_table(name):
+    connect()
+    try:
+        return bool(_conn.execute(
+            "SELECT 1 FROM g.sqlite_master WHERE type='table' AND name=?",
+            (name,)).fetchone())
+    except Exception:
+        return False
+
+
+def has_us_p1():
+    """global 库是否已导入美股 P1 qfq 表."""
+    return _has_g() and _g_table(US_P1_TABLE)
+
+
+def us_p1_universe():
+    """标普500 当前成分 [(us:CODE, CODE)]. 缺清单时回退库内 US 成分."""
+    out = []
+    try:
+        with open(US_P1_TICKERS, encoding="utf-8") as f:
+            for line in f:
+                c = line.strip()
+                if c and not c.startswith("#"):
+                    out.append(("us:" + c, c))
+    except OSError:
+        pass
+    if out:
+        return out
+    return universe("us")
+
+
+def get_us_p1_bars(mcode, tail=None):
+    """美股 P1 qfq 日K -> [Bar] (含未复权 raw_close 供美元成交额).
+
+    数据来自 g.us_daily_qfq; raw_close 取 g.daily_bars 同代码同日未复权
+    close, 缺失时回退 qfq close (最新日两者一致).
+    """
+    if not has_us_p1():
+        return []
+    m, code = _split(mcode)
+    if m != "us":
+        return []
+    code = code.upper()
+    con = connect()
+    base = (f"SELECT q.date,q.open,q.high,q.low,q.close,q.vol,"
+            f"COALESCE(r.close,q.close) AS raw_close "
+            f"FROM g.{US_P1_TABLE} q LEFT JOIN g.daily_bars r "
+            f"ON r.market='US' AND r.code=q.code AND r.date=q.date "
+            f"WHERE q.code=?")
+    if tail:
+        sql = (f"SELECT * FROM ({base} ORDER BY q.date DESC LIMIT ?) "
+               f"ORDER BY date")
+        args = (code, int(tail))
+    else:
+        sql = base + " ORDER BY q.date"
+        args = (code,)
+    rows = con.execute(sql, args).fetchall()
+    label = f"us:{code}"
+    return [Bar(code=label, date=r["date"], open=r["open"] or 0.0,
+                high=r["high"] or 0.0, low=r["low"] or 0.0,
+                close=r["close"] or 0.0, vol=r["vol"] or 0.0,
+                raw_close=r["raw_close"] or 0.0)
+            for r in rows]
+
+
 def get_bars(mcode, tail=None):
     """统一日K升序 -> [Bar]. mcode 如 sh600000 / hk:00700."""
     m, code = _split(mcode)
