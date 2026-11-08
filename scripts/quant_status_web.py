@@ -1580,15 +1580,14 @@ function drawEquity(canvasId, seriesList, opts){
     if(pts.length < 2) return;
     ctx.strokeStyle = colors[si % colors.length];
     ctx.lineWidth = 1.6; ctx.beginPath();
-    var started = false, prevIdx = -2;
+    var started = false;
     for(var k=0;k<pts.length;k++){
       var d = pts[k][0], v = pts[k][1];
       var i = di[d];
       if(i === undefined) continue;
       var px = x(i), py = y(v);
-      if(!started || i !== prevIdx + 1){ ctx.moveTo(px, py); started = true; }
+      if(!started){ ctx.moveTo(px, py); started = true; }
       else ctx.lineTo(px, py);
-      prevIdx = i;
     }
     ctx.stroke();
   });
