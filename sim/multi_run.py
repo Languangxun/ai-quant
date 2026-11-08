@@ -77,6 +77,63 @@ def _load_state(market, capital, fees):
                         transfer_fee_rate=fees.get("transfer_fee_rate", 0)), p
 
 
+
+
+def _sm702_crypto_signals(topk=3, threshold=0.55, date_limit=None):
+    """sm702 加密模型信号源（walk-forward stop_overlay 输出）。
+
+    读 logs/sm702_crypto_signal.csv（由桌面机每日推送），
+    取 prob>=threshold 的 TopK，转成 core Signal 对象。
+    CSV 缺失 / 日期过旧 返回 []（由调用方回退 sm701_universal）。"""
+    import csv as _csv
+    import re as _re
+    from datetime import datetime as _dt, timedelta as _td
+    from core.types import Signal
+    path = "/home/lan/ai-quant/logs/sm702_crypto_signal.csv"
+    if not os.path.exists(path):
+        return []
+    newest = None
+    try:
+        with open(path, encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                d = row.get("date") or ""
+                if d and (not newest or d > newest):
+                    newest = d
+    except Exception:
+        return []
+    if not newest:
+        return []
+    try:
+        gdate = _dt.strptime(newest, "%Y-%m-%d").date()
+    except ValueError:
+        return []
+    # 信号允许 3 天内（模型跑批日数据滞后容忍）
+    if _dt.now().date() - gdate > _td(days=3):
+        print(f"[crypto] sm702 信号过旧({newest})，跳过", flush=True)
+        return []
+    out = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                p = float(row.get("prob") or 0)
+                d = row.get("date") or ""
+                if d != newest or p < threshold:
+                    continue
+                raw = (row.get("code") or "").upper()
+                m = _re.match(r"^(.+?)(USDT|BUSD|BTC|ETH)$", raw)
+                sym = (m.group(1) + "/" + m.group(2)) if m else raw
+                out.append(Signal(
+                    code="crypto:" + sym, action="BUY",
+                    score=float(p),
+                    reason=f"sm702 crypto P={p:.4f}(stop_overlay)",
+                    signal_date=d or newest))
+    except Exception as e:
+        print(f"[crypto] sm702 信号读取失败 {type(e).__name__}: {e}", flush=True)
+        return []
+    out.sort(key=lambda s: -(s.score or 0))
+    return out[:max(1, int(topk))]
+
+
 def run_one(market, top=5, limit=200, dry_run=False, threshold=None):
     from strategies import builtin as _b  # noqa: 注册策略
     from strategies import registry
@@ -115,9 +172,19 @@ def run_one(market, top=5, limit=200, dry_run=False, threshold=None):
     snap = {c: bs[-200:] for c, bs in bars_map.items()}
     sigs = strat.generate(snap, {"date": today, "threshold": thr,
                                  "topk": max_pos})
+    if market == "crypto":
+        try:
+            override = _sm702_crypto_signals(topk=max_pos, threshold=thr,
+                                             date_limit=today)
+            if override:
+                print(f"[crypto] sm702 信号 {len(override)} 只覆盖退出灌排", flush=True)
+                sigs = override
+        except Exception as _e:
+            print(f"[crypto] sm702 信号失败 {_e}", flush=True)
     want = [s for s in sigs[:max_pos]]
+    _fmt = (lambda v: f"{v:.3f}") if market == "crypto" else (lambda v: f"{v:.0f}")
     print(f"[{market}] {today} 信号 {len(sigs)} Top{max_pos}: " +
-          ", ".join(f"{s.code} {s.score:.0f}" for s in want))
+          ", ".join(f"{s.code} {_fmt(s.score)}" for s in want))
     acc, path = _load_state(market, capital, fees)
     model = MarketModel()
     px = {c: bs[-1].close for c, bs in bars_map.items() if bs[-1].close}
