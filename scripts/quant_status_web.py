@@ -1211,6 +1211,9 @@ pre {{ background: var(--bg); padding: 12px; border-radius: 6px; overflow-x: aut
     <span style="font-size:11px;color:var(--muted);letter-spacing:1px">GUANCHAO QUANT</span>
     <span style="opacity:.55">·</span>
     <span>Powered by 獨白量化</span>
+    <img src="/web_assets/sm_logo.png" alt="sm701"
+         style="height:22px;border-radius:4px;display:inline-block;vertical-align:middle"
+         onerror="this.style.display='none'"/>
     <span style="opacity:.55">·</span>
     <span><a href="https://github.com/Languangxun/ai-quant" style="color:var(--accent);text-decoration:none" target="_blank"># ai-quant</a></span>
   </div>
@@ -1872,10 +1875,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_response(403)
                     self.end_headers()
                     self.wfile.write(b"forbidden or not found")
-            elif path in ("/web_assets/logo.png", "/web_assets/favicon.png"):
-                logo = os.path.join(BASE_DIR, "scripts", "web_assets",
-                                    os.path.basename(path))
-                if os.path.exists(logo):
+            elif path.startswith("/web_assets/") and path.endswith(".png"):
+                _name = os.path.basename(path)
+                logo = os.path.join(BASE_DIR, "scripts", "web_assets", _name)
+                if _name in ("logo.png", "favicon.png", "sm_logo.png") \
+                        and os.path.exists(logo):
                     send_file_with_range(self, logo)
                 else:
                     self.send_response(404)
