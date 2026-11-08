@@ -1204,18 +1204,20 @@ pre {{ background: var(--bg); padding: 12px; border-radius: 6px; overflow-x: aut
 </div>
 <footer style="border-top:1px solid var(--border);margin-top:28px;padding:18px 24px;text-align:center;color:var(--muted);font-size:12px">
   <div style="display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap">
-    <img src="/web_assets/logo.png" alt="观潮量化"
-         style="height:44px;border-radius:8px;display:inline-block"
-         onerror="this.style.display='none'"/>
+    <a href="https://quant.tail6a6cc8.ts.net/quant" style="display:inline-block;line-height:0">
+      <img src="/web_assets/logo.png" alt="观潮量化"
+           style="height:44px;border-radius:8px;display:inline-block"
+           onerror="this.style.display='none'"/>
+    </a>
     <span style="font-size:14px;color:var(--text);font-weight:600">观潮量化</span>
     <span style="font-size:11px;color:var(--muted);letter-spacing:1px">GUANCHAO QUANT</span>
     <span style="opacity:.55">·</span>
-    <span>Powered by 獨白量化</span>
-    <img src="/web_assets/sm_logo.png" alt="sm701"
-         style="height:22px;border-radius:4px;display:inline-block;vertical-align:middle"
-         onerror="this.style.display='none'"/>
-    <span style="opacity:.55">·</span>
-    <span><a href="https://github.com/Languangxun/ai-quant" style="color:var(--accent);text-decoration:none" target="_blank"># ai-quant</a></span>
+    <span>Powered by</span>
+    <a href="https://github.com/Languangxun/sm702" target="_blank" style="display:inline-block;line-height:0">
+      <img src="/web_assets/sm_logo.png" alt="sm702"
+           style="height:22px;border-radius:4px;display:inline-block;vertical-align:middle"
+           onerror="this.style.display='none'"/>
+    </a>
   </div>
 </footer>
 </body>
